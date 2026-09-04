@@ -2,311 +2,254 @@
 
 ## Status
 
-- Planning document for `feature/coreweave-delta-replay`.
-- Branch base: `hwoo/mx-delta-v4.1-vllm` at `2062cf9`.
-- Scope: reconstruct an explicitly requested target revision from a verified local
-  checkpoint by applying every missing delta in order, then install the final
-  checkpoint into the inference engine once.
+- Updated 2026-09-04 after rebasing `feature/coreweave-delta-replay` onto
+  `main` at `e8761dd`.
+- The initial target-version replay milestone shipped in
+  `feat(refit): add target-version delta replay (#710)`.
+- Full Hugging Face checkpoint anchors, immutable local artifacts, bounded
+  cache management, and interrupted-update recovery are also present on
+  `main`.
+- Remaining work is CoreWeave fleet integration, external-format coverage, and
+  production acceptance rather than the core replay algorithm.
 
-## Why replay is required
+## Outcome
 
-An XOR delta is valid only against its declared base. A worker at `v0` cannot
-apply `delta(v2 -> v3)` directly. A replacement, restarted, or newly scaled
-worker must either obtain a complete current checkpoint or reconstruct it:
+A generator can now request an explicit target revision while serving an older
+revision. ModelExpress resolves the complete READY lineage, prepares all missing
+revisions in order, and installs only the final reconstructed checkpoint:
 
 ```text
-full v0 -> delta v1 -> delta v2 -> delta v3 -> install v3
+serving v0 -> resolve v1, v2, v3 -> materialize v3 -> install v3 once
 ```
 
-The revision catalog already records `target_version`, `base_version`,
-`target_digest`, `base_digest`, and `format_digest`. The receiver already
-performs exact-base reconstruction for one delta. Replay composes those two
-primitives without weakening their validation.
+A full checkpoint may reset the lineage:
+
+```text
+serving v0 -> full v4 -> delta v5 -> materialize v5 -> install v5 once
+```
+
+The implementation does not select a deployment's desired revision. The caller
+must provide the target identity, which preserves a clean boundary between the
+ModelExpress data plane and the CoreWeave rollout orchestrator.
+
+## Implemented design
+
+### Chain resolution
+
+`ModelExpressGeneratorClient._resolve_replay_chain()` walks backward from the
+requested target to either the generator's serving revision or the nearest full
+checkpoint. Before acquiring revision leases or preparing payloads, it checks:
+
+- every revision exists, is READY, and belongs to the configured model;
+- traversal is cycle-free and does not exceed `max_replay_chain_length`;
+- every revision has a usable object-storage source;
+- layout signatures remain compatible when present;
+- a full checkpoint has no base revision;
+- an XOR delta has an exact base revision; and
+- every revision can use one compatible preparation method and installer.
+
+The resolved revisions are reversed into base-to-target order. A request for an
+already-serving, verified revision takes the warm no-op path.
+
+### Atomic preparation and one final install
+
+`WeightUpdateSession.stage_chain()` holds a lease for every revision in the
+resolved chain and delegates the complete chain to one update method.
+`CanonicalDeltaUpdateMethod.prepare_chain()` prepares an ordinary installable
+checkpoint without mutating the inference engine.
+
+`_LocalCheckpoint.prepare_chain()` then:
+
+1. takes the host-local preparation and installation locks;
+2. validates every index manifest before changing checkpoint bytes;
+3. downloads or reuses immutable full and delta artifacts;
+4. applies each XOR delta against its exact materialized base;
+5. verifies reconstructed tensor checksums after each apply; and
+6. returns the final checkpoint to the engine installer.
+
+Only `WeightUpdateSession.apply()` installs weights. Intermediate revisions are
+never exposed to the engine, and `active.json` advances only after the final
+installation succeeds.
+
+### Local checkpoint lifecycle
+
+The cache separates canonical inputs from derived checkpoints:
+
+```text
+<refit_checkpoint_dir>/<model>/
+  full/<version>/            immutable full checkpoints
+  deltas/<version>/          immutable delta payloads
+  chains/<version>.json      resolved full anchor plus ordered deltas
+  materialized/<version>/    derived installable checkpoints
+  state.json                 preparation state and file identity
+  active.json                last successfully installed revision
+```
+
+The first delta after a full checkpoint copies the immutable full artifact.
+Sequential deltas may rename and update the derived materialization in place,
+avoiding another full-model copy. Cache capacity enforcement protects the
+active lineage and current update while preferring eviction of rebuildable
+materializations.
+
+An interrupted or failed preparation leaves `state.json` in `UPDATING` unless
+the failure is a pre-mutation validation or capacity error. Initialization does
+not trust that state; it restores a verified launch seed before accepting a new
+update. A failed engine installation leaves the prepared disk checkpoint READY
+but keeps `active.json` on the prior revision. The generator marks the engine
+state uncertain until a subsequent successful installation restores a known
+revision.
+
+### Full checkpoint anchors
+
+`FULL_HF_CHECKPOINT` is an explicit payload format and a legal replay anchor.
+Resolution stops at the first full checkpoint encountered while walking toward
+the active revision. The receiver downloads and verifies its complete tensor
+set, records it under `full/`, and uses it as the base for later deltas. This
+allows bounded recovery without replaying all the way back to the launch seed.
+
+## Implementation map
+
+| Responsibility | Current location |
+|---|---|
+| Target lookup and backward chain resolution | `modelexpress_rl/inference/client.py` |
+| Revision leases and chain staging | `modelexpress_rl/inference/session.py` |
+| Method selection and chain capability | `modelexpress_rl/inference/plan.py` |
+| Canonical S3 preparation adapter | `modelexpress_rl/inference/methods/canonical_delta.py` |
+| Manifest validation, download, apply, and recovery | `modelexpress_rl/inference/receiver.py` |
+| Immutable artifacts, chain records, locks, and capacity | `modelexpress_rl/inference/checkpoint_store.py` |
+| vLLM checkpoint installation | `modelexpress_rl/inference/engines/vllm/` |
+| User-facing configuration and operations | `docs/S3_DELTA_WEIGHT_REFIT.md` |
+
+All code paths above are rooted at `modelexpress_client/python/`.
 
 ## Required invariants
 
-1. Never apply a delta to a checkpoint whose version and digest do not exactly
-   match the delta's declared base.
-2. Resolve and validate the entire chain before mutating checkpoint bytes.
-3. Every revision in the chain must belong to the requested model and be
-   `READY` or `COMMITTED`.
-4. Adjacent revisions must agree on version, base digest, and format digest.
-5. Detect cycles, missing parents, self-parenting revisions, and excessive chain
-   depth before apply.
-6. Verify every reconstructed revision before advancing to the next delta.
-7. Do not expose or install an intermediate revision into the inference engine.
-8. Install the final reconstructed checkpoint once and report the final revision
-   as active only after engine installation succeeds.
-9. A failed replay must never be mistaken for a valid checkpoint. The local
-   journal remains poisoned until the checkpoint is reseeded or recovered.
-10. Repeating a request for an already verified target is a no-op.
+These remain release-blocking invariants for any follow-up change:
 
-## Contract boundary
+1. Never apply a delta unless the local version exactly matches its declared
+   base.
+2. Resolve the entire control-plane chain and validate all index manifests
+   before mutating checkpoint bytes.
+3. Accept only READY revisions for the requested model.
+4. Detect cycles, missing parents, invalid payload transitions, and excessive
+   depth before payload preparation.
+5. Preserve a stable layout signature across the chain when signatures are
+   provided.
+6. Verify each reconstructed tensor before advancing to the next delta.
+7. Never install an intermediate revision.
+8. Advance the active revision only after engine installation succeeds.
+9. Never reuse an interrupted or externally modified materialization as a
+   verified checkpoint.
+10. Repeating a request for the active verified target is a no-op.
 
-The development branch currently uses custom delta-index and bucket objects with
-SHA-256 digests. The finalized CoreWeave contract uses safetensors shards,
-per-tensor zstd frames, and checksums stored in safetensors metadata.
+## Remaining CoreWeave work
 
-Chain resolution must therefore operate only on revision relationships and
-digests; it must not depend on the current bucket encoding. Payload application
-stays behind the receiver's single-revision apply boundary. Before production
-acceptance, that boundary must consume the finalized CoreWeave checkpoint
-format. Replay should not make the development format a new public contract.
+### 1. Cold-start and scale-out orchestration (P0)
 
-## Current building blocks
+CoreWeave must persist or otherwise resolve the deployment's desired target and
+pass that exact identity to each replacement or newly scaled worker. A new
+worker must remain quarantined until preparation, installation, and target
+identity verification succeed.
 
-| Building block | Existing location |
-|---|---|
-| Exact revision lookup | `modelexpress/refit/catalog.py` |
-| Parent and digest metadata | `modelexpress/refit/manifest.py` |
-| Exact-base checkpoint validation and XOR apply | `modelexpress/refit/receiver.py` |
-| Persistent checkpoint journal and poison marker | `modelexpress/refit/receiver.py` |
-| vLLM final installation | `modelexpress/engines/vllm/refit/` |
-| SGLang final installation | `modelexpress/engines/sglang/refit/` |
-| Receiver status/result types | `modelexpress/refit/api.py` |
-
-## Proposed design
-
-### 1. Pure chain resolver
-
-Add a small engine- and payload-independent resolver, preferably
-`modelexpress/refit/replay.py`:
-
-```python
-@dataclass(frozen=True)
-class ResolvedRevisionChain:
-    model_id: str
-    base_version: str
-    target_version: str
-    revisions: tuple[RevisionRecord, ...]  # forward order, base excluded
-
-
-def resolve_revision_chain(
-    catalog: RevisionCatalog,
-    *,
-    model_id: str,
-    current_version: str,
-    current_digest: str,
-    target_version: str,
-    format_digest: str,
-    max_depth: int,
-) -> ResolvedRevisionChain:
-    ...
-```
-
-Resolution walks backward from the requested target using exact
-`get_revision()` calls until it reaches `current_version`, then reverses the
-records into apply order. It validates:
-
-- model identity;
-- allowed revision state;
-- non-empty and distinct target/base versions;
-- cycle-free parent traversal;
-- the configured maximum depth;
-- one stable format digest;
-- target/base digest continuity between every adjacent pair; and
-- agreement between the oldest delta and the caller's current digest.
-
-The first implementation takes an explicit target version. Discovering the
-deployment's latest active revision belongs to the CoreWeave orchestrator and
-is not required to implement safe replay.
-
-### 2. Receiver preparation API
-
-Add `prepare_to_version(target_version)` to `ModelExpressWeightReceiver` and a
-chain-oriented method to `_LocalCheckpoint`.
-
-Expected lifecycle:
+Required end-to-end flow:
 
 ```text
-resolve full chain
-    -> lock local checkpoint
-    -> revalidate journal version/digest
-    -> apply and verify each revision in forward order
-    -> return one PreparedRevision for the final target
-    -> install final checkpoint once
-    -> mark final revision VERIFIED
+start and quarantine worker
+  -> resolve deployment target
+  -> initialize verified local seed/cache
+  -> request explicit target
+  -> replay from serving seed or nearest full anchor
+  -> install target
+  -> report per-replica target READY
+  -> admit rollout traffic
 ```
 
-Do not implement replay by repeatedly calling the public
-`start_weight_update()` and `update_weights()` pair: that would reload the full
-model into the GPU after every intermediate delta. Intermediate progress is a
-disk reconstruction concern; only the requested target is an engine update.
+This work owns desired-version persistence, retry policy, per-replica status,
+and admission. ModelExpress continues to own exact-target reconstruction and
+rank-local installation.
 
-The checkpoint lock should cover the complete replay so another local rank
-cannot observe or independently mutate an intermediate version. Followers that
-acquire the lock afterward should see the final journal state and take the warm
-no-op path.
+### 2. External checkpoint-format acceptance (P0)
 
-### 3. Journal and recovery behavior
+The receiver consumes the canonical safetensors layout, per-tensor zstd frames,
+and post-apply checksums. Production acceptance still needs fixtures produced
+outside ModelExpress and compatibility coverage for the finalized CoreWeave
+writer.
 
-Before applying the first delta, persist a replay journal containing at least:
+The current reader requires XOR encoding with `adler32`. The supplied format
+document also names `xxh3-128` and `blake3`, with `xxh3-128` described as the
+newer slime default. Either the CoreWeave writer must pin `adler32` for launch,
+or ModelExpress must add and test the agreed checksum algorithms.
 
-```json
-{
-  "poisoned": true,
-  "replay_base_version": "v0",
-  "replay_target_version": "v3",
-  "last_verified_version": "v0"
-}
-```
+Required tests:
 
-After each delta verifies, update `last_verified_version` and its digest. Clear
-the poisoned marker only after the final revision is verified and the normal
-checkpoint state has been written atomically.
+- consume externally generated full and delta checkpoints;
+- verify shard numbering, tensor maps, zstd frame boundaries, and metadata;
+- reject missing, duplicated, unsafe, or malformed shard references;
+- reject wrong versions, bases, layouts, encodings, and checksums; and
+- prove bit-for-bit equality with a direct full load at the target.
 
-For the initial implementation, any interrupted or failed replay reseeds the
-working checkpoint from the configured launch checkpoint and starts replay
-again. Resuming from an in-place intermediate revision is unsafe unless the
-journal and checkpoint bytes can be proven consistent. Copy-on-write checkpoint
-publication may be evaluated separately because duplicating multi-terabyte
-checkpoints has a substantial capacity and latency cost.
+### 3. Fleet-level validation (P0)
 
-### 4. Initialization and cold start
+Run the production topology with tensor parallelism and multiple replicas:
 
-Change initialization so it distinguishes:
+- a replacement worker reaches the deployment target before serving;
+- a scale-out worker reaches the same target before serving;
+- multiple ranks sharing a host perform one local reconstruction and one
+  install per rank;
+- a middle-delta download, decode, checksum, or disk-capacity failure never
+  changes the active revision;
+- restart from `UPDATING` restores a known seed and replays successfully;
+- a failed engine install keeps the replica quarantined until a successful
+  recovery install; and
+- final parameters and generations match a direct full checkpoint load.
 
-- a verified reusable local checkpoint;
-- a poisoned or externally modified checkpoint that must be reseeded;
-- a launch checkpoint that is the configured replay anchor; and
-- the explicit target revision requested by the orchestrator.
+### 4. Engine and serving integration (P1)
 
-The current code reseeds whenever the journal version differs from
-`initial_version`. That prevents reuse of a valid later revision and must be
-changed. A later local checkpoint may be reused only after its version, digest,
-format digest, and file state are validated against the catalog.
+The replay implementation produces a normal checkpoint directory and is
+engine-independent up to installation, but the current documented production
+path is vLLM. Validate SGLang installation separately if CoreWeave requires it.
 
-Cold-start orchestration is then:
+Fleet readiness should ultimately expose the installed revision per replica.
+Served revision identity in inference responses, HTTP 425 transition behavior,
+prompt-cache reset policy, and hot-load cancellation/history remain separate
+requirements and are not implied by chain replay.
 
-```text
-start/quarantine worker
-    -> determine explicit deployment target
-    -> initialize or reseed verified local anchor
-    -> prepare_to_version(target)
-    -> install target
-    -> report VERIFIED
-    -> admit rollout traffic
-```
+## Delivery plan
 
-### 5. Full checkpoint anchors
-
-Delta-only replay can begin using the configured launch checkpoint as the
-anchor. Complete CoreWeave recovery also requires full checkpoints that reset
-the chain.
-
-The catalog needs an explicit payload kind, rather than inferring full versus
-delta from missing fields. A follow-up protocol change should distinguish:
-
-- metadata-only launch anchor;
-- full Hugging Face checkpoint; and
-- XOR delta checkpoint.
-
-Once supported, chain resolution should stop at the nearest usable full
-checkpoint, acquire and verify it, and replay only later deltas. Selection must
-be deterministic and bounded; it must not silently fall back to an older model
-after the orchestrator requested a newer target.
-
-## Failure behavior
-
-| Failure | Required result |
-|---|---|
-| Target revision missing | Fail before local mutation |
-| Parent revision missing | Fail before local mutation and identify the missing version |
-| Cycle or self-parent | Fail before local mutation |
-| Chain exceeds limit | Fail before local mutation |
-| Model or format mismatch | Fail before local mutation |
-| Adjacent digest mismatch | Fail before local mutation |
-| S3 download failure | Keep checkpoint poisoned; permit reseed and retry |
-| Delta decompression/checksum failure | Keep checkpoint poisoned; never install |
-| Engine install fails before mutation | Report `FAILED`; reconstructed disk target may remain reusable |
-| Engine install may have mutated weights | Report `POISONED`; worker must remain quarantined/replaced |
-
-Errors should include the model, requested target, failing revision, and replay
-position without exposing credentials or signed object-store URLs.
-
-## Test plan
-
-### Chain resolver tests
-
-- Direct parent update (`v0 -> v1`).
-- Multi-hop replay (`v0 -> v1 -> v2 -> v3`).
-- Already-at-target no-op.
-- Missing target and missing intermediate parent.
-- Self-parent and multi-node cycle.
-- Maximum-depth rejection.
-- Wrong model ID.
-- Non-ready revision.
-- Format-digest mismatch.
-- Base-version and base-digest discontinuity.
-
-### Checkpoint replay tests
-
-- Apply three deltas and compare the final safetensors bytes with a full target
-  checkpoint.
-- Verify one engine install for a multi-delta replay.
-- Confirm another rank sharing the cache performs no additional downloads.
-- Fail the middle delta and prove no engine installation occurs.
-- Restart after a poisoned middle delta, reseed, and successfully replay.
-- Reuse a verified later local checkpoint without reseeding.
-- Reject externally modified checkpoint files.
-- Retry an already completed target without applying XOR twice.
-
-### Engine integration tests
-
-- vLLM lifecycle order remains `start -> receive/install -> finish`.
-- Receiver becomes `VERIFIED` only after vLLM finalization succeeds.
-- vLLM finalization failure leaves the receiver `POISONED`.
-- TP greater than one uses one host-local replay and one install per rank.
-- Parameter equality and generation parity against a full load of the target.
-- Quantized and CUDA-graph-captured model coverage.
-
-### CoreWeave-format tests
-
-- Consume externally produced canonical safetensors delta fixtures.
-- Enforce version/base metadata and checksum algorithm selection.
-- Reject malformed shard numbering, missing tensors/checksums, wrong zstd
-  frames, and out-of-order application.
-- Start from a full checkpoint and replay subsequent deltas.
-
-## Delivery sequence
-
-1. **Contract alignment:** isolate payload decoding and add CoreWeave-format
-   fixtures before extending replay around the legacy bucket encoding.
-2. **Chain resolution:** implement and unit-test backward traversal and all
-   pre-mutation validation.
-3. **Disk replay:** apply a resolved chain under one lock, journal progress, and
-   produce one final `PreparedRevision`.
-4. **Engine integration:** expose `prepare_to_version()` through SGLang and
-   vLLM while preserving one final engine install.
-5. **Restart recovery:** reuse verified later checkpoints and automatically
-   reseed poisoned checkpoints before replay.
-6. **Full anchors:** add explicit full-checkpoint catalog records and nearest
-   viable baseline selection.
-7. **Fleet integration:** let the CoreWeave orchestrator provide the active
-   target, quarantine new workers, and consume per-replica replay status.
+1. **External fixtures:** agree on the launch checksum algorithm and pass
+   CoreWeave-produced full/delta fixtures through the existing receiver tests.
+2. **Fleet contract:** define desired-target lookup, trigger input, per-replica
+   status, quarantine, timeout, and retry behavior with the orchestrator.
+3. **Cold-start integration:** wire explicit-target replay into replacement and
+   scale-out worker startup.
+4. **Failure drills:** exercise corrupt objects, missing lineage, full-anchor
+   fallback, interrupted preparation, failed installation, and cache pressure.
+5. **Performance validation:** measure chain-resolution RPCs, S3 download,
+   reconstruction, disk working set, and final installation at target scale.
+6. **Launch acceptance:** demonstrate target identity, parameter equality, and
+   generation parity across every replica before traffic admission.
 
 ## Acceptance criteria
 
-Replay is complete for the initial delta-only milestone when:
+The CoreWeave cold-start replay work is complete when:
 
-- a worker starting at a verified configured anchor reaches an explicit target
-  through any valid bounded delta chain;
-- every chain relationship and reconstructed revision is verified;
-- no intermediate version is installed into the inference engine;
-- a failed or interrupted replay cannot serve or masquerade as the target;
-- retry and restart behavior is deterministic; and
-- final model bytes and generation match a direct full load of the target.
+- every new or replacement replica is given the deployment's explicit target;
+- the replica remains out of service until that exact target is installed;
+- any valid bounded chain from a verified seed or full anchor reconstructs the
+  target with all relationships and tensor results verified;
+- only the target revision is installed and reported active;
+- interrupted preparation and failed installation recover deterministically
+  without serving an unknown or stale revision;
+- externally produced launch-format checkpoints pass conformance tests; and
+- all ranks and replicas match a direct full load in weights and generation.
 
-Full CoreWeave cold-start inheritance additionally requires full-checkpoint
-anchors, active-target discovery by the deployment orchestrator, and externally
-visible per-replica readiness.
+## Non-goals of replay
 
-## Explicit non-goals for the initial replay change
-
-- Selecting the deployment's latest active revision.
-- Generator-to-generator RDMA fanout.
+- Selecting the deployment's desired revision inside ModelExpress.
+- Generator-to-generator RDMA fanout policy.
 - HTTP 425 transition handling.
 - Prompt-cache reset policy.
 - Served revision identity in inference responses.
 - Experience-payload transfer.
+- Quantizing training-precision checkpoints during hot-load.
 - Replaying an unbounded chain without a configured safety limit.
