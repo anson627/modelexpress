@@ -34,6 +34,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 32
     assert envs.MX_S3_MAX_ATTEMPTS == 5
     assert envs.MX_S3_TCP_KEEPALIVE is True
+    assert envs.MX_REFIT_STREAM_WINDOW_LAYERS == 2
     assert envs.MX_REFIT_DELTA_SURGICAL is False
 
 
@@ -142,6 +143,14 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "sometimes")
     with pytest.raises(ValueError, match="MX_S3_TCP_KEEPALIVE must be a boolean"):
         _ = envs.MX_S3_TCP_KEEPALIVE
+
+
+def test_stream_window_layers_accepts_zero_and_rejects_negative(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", "0")
+    assert envs.MX_REFIT_STREAM_WINDOW_LAYERS == 0
+    monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", "-1")
+    with pytest.raises(ValueError, match="MX_REFIT_STREAM_WINDOW_LAYERS must be"):
+        envs.MX_REFIT_STREAM_WINDOW_LAYERS
 
 
 def test_delta_surgical_parses_boolean(monkeypatch):
