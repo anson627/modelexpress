@@ -155,6 +155,7 @@ class LocalCheckpointStore:
         #     deltas/<version>/         immutable delta index and shards
         #     chains/<version>.json     full ancestor plus ordered deltas
         #     materialized/<version>/   derived, installable full checkpoints
+        #     staging/<version>/        derived nonzero XOR bytes of one delta
         #     state.json                current preparation transaction
         #     speculation.json          unregistered target being prepared ahead
         #     active.json               version committed after engine install
@@ -172,6 +173,7 @@ class LocalCheckpointStore:
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
         self.materialized_cache = self.cache / "materialized"
+        self.staging_cache = self.cache / "staging"
         self.state_path = self.cache / "state.json"
         self.speculation_path = self.cache / "speculation.json"
         self.active_path = self.cache / "active.json"
@@ -187,6 +189,7 @@ class LocalCheckpointStore:
             self.delta_cache,
             self.chain_cache,
             self.materialized_cache,
+            self.staging_cache,
         ):
             path.mkdir(exist_ok=True)
 
@@ -256,6 +259,9 @@ class LocalCheckpointStore:
     def materialized_path(self, version: str) -> Path:
         return self._version_path(self.materialized_cache, version)
 
+    def staging_path(self, version: str) -> Path:
+        return self._version_path(self.staging_cache, version)
+
     def chain_path(self, version: str) -> Path:
         return self.chain_cache / f"{_encode_cache_component(version)}.json"
 
@@ -286,6 +292,7 @@ class LocalCheckpointStore:
                 self.full_cache,
                 self.delta_cache,
                 self.materialized_cache,
+                self.staging_cache,
             )
         )
 
@@ -298,6 +305,7 @@ class LocalCheckpointStore:
                     self.full_path(version),
                     self.delta_path(version),
                     self.materialized_path(version),
+                    self.staging_path(version),
                 }
             )
             chain = self.chain(version)
@@ -315,6 +323,7 @@ class LocalCheckpointStore:
 
     def _eviction_candidates(self, protected: set[Path]) -> list[Path]:
         groups = (
+            self.staging_cache,
             self.materialized_cache,
             self.delta_cache,
             self.full_cache,
@@ -467,7 +476,12 @@ class LocalCheckpointStore:
 
         Callers hold the exclusive cache lock and own the state transition.
         """
-        for path_for in (self.full_path, self.delta_path, self.materialized_path):
+        for path_for in (
+            self.full_path,
+            self.delta_path,
+            self.materialized_path,
+            self.staging_path,
+        ):
             source, target = path_for(old), path_for(new)
             if source.exists():
                 shutil.rmtree(target, ignore_errors=True)
