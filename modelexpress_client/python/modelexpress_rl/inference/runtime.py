@@ -400,6 +400,11 @@ def initialize_generator_runtime(
                         ),
                     )
                 ),
+                prefer_prepared=(
+                    canonical_method.is_prepared
+                    if canonical_method is not None and rl_envs.MX_REFIT_PREFER_PREPARED
+                    else None
+                ),
             ),
             p2p_client=p2p_client,
             initial_version_id=(
