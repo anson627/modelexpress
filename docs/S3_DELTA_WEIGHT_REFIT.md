@@ -54,6 +54,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
 | `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
 | `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. A delta is verified and installed before the checkpoint files are rewritten. See [In-place install](#in-place-install). |
+| `MX_REFIT_STAGED_LAYERS` | `8` | Most deltas staged on the checkpoint files at once. Below it, a delta is checked through the staged ones without writing; at it, a preparation writes them into the files first. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
@@ -274,8 +275,8 @@ the checkpoint before accepting another update.
 
 `state.json` records whether preparation is `READY`, `STAGED`, or `UPDATING` and
 protects against interrupted writes. A `STAGED` version is verified and staged,
-but its base's checkpoint files have not been rewritten yet; see
-[Install before rewrite](#install-before-rewrite). `active.json` changes only
+but the checkpoint files still hold an earlier version, and every delta since is
+staged as well; see [Install before rewrite](#install-before-rewrite). `active.json` changes only
 after engine installation succeeds, so a failed download, reconstruction, or
 install retains the previous active engine version. The cache lock coordinates
 artifact mutations. The installation lock is held shared by concurrent
@@ -388,8 +389,10 @@ The corresponding generator configuration would use:
 
 `refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
 gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
-`deltas/`, and `materialized/`. It defaults to 2000 GB; set it to `null` to
-disable the configured quota.
+`deltas/`, `materialized/`, and `staging/`. It defaults to 2000 GB; set it to
+`null` to disable the configured quota. Writing staged deltas into a full
+checkpoint's files needs room for one more copy of them, since full checkpoints
+never change; see [Install before rewrite](#install-before-rewrite).
 At initialization, ModelExpress caps the quota at the existing model cache size
 plus available filesystem space. A short INFO log reports the cap and free space
 when this reduces the configured quota or replaces `null` with a disk-based
@@ -763,28 +766,37 @@ rewrite for later:
 ```mermaid
 stateDiagram-v2
     READY --> STAGED: check the next delta
-    STAGED --> READY: rewrite the files while the engine serves
-    STAGED --> STAGED: rewrite and check the next delta in one pass
+    STAGED --> STAGED: check the next delta through the staged ones
+    STAGED --> READY: at the layer limit, write the staged deltas into the files
 ```
 
-- On a `READY` head, one pass reads the head's files, XORs the delta, and checks
-  every target checksum without writing. It stages the delta's nonzero bytes,
-  and the target becomes the `STAGED` head, whose files still hold its base. A
-  delta that fails its checksums leaves the head `READY` and unchanged.
-- The engine installs a `STAGED` target from its staging. Where it must reload
-  instead, it reads the base's files with the staged bytes XORed in, so the
-  reload sees the target's bytes.
-- Once the engine has activated a `STAGED` head, the prefetcher writes the
-  staged bytes into the files, which makes the head `READY`. If a delta on top
-  of the head appears first, or arrives during that rewrite, the rest of the
-  rewrite and the new delta's check run as one pass, and the new delta becomes
-  the `STAGED` head on the rewritten files. The prefetcher sees such a delta in
-  the registry or the S3 watch, or from `want.json`, which an engine writes
-  while it waits to prepare a target.
+- One pass reads the files, XORs in the deltas already staged on them, then
+  XORs the new delta and checks every target checksum, without writing. It
+  stages the new delta's nonzero bytes, and its target becomes the `STAGED`
+  head. The pass costs the same however many deltas are staged, apart from
+  XORing their bytes in memory, so a small delta stays fast after a dense one.
+  A delta that fails its checksums leaves the head unchanged.
+- Deltas stay staged until there are `MX_REFIT_STAGED_LAYERS` of them (default
+  8). Once the engine has activated a head at that limit, the prefetcher writes
+  its staged deltas into the files, which makes the head `READY`. A delta on top
+  of the head that arrives meanwhile joins that pass and becomes the only one
+  staged on the rewritten files. The prefetcher sees such a delta in the
+  registry or the S3 watch, or from `want.json`, which an engine writes while it
+  waits to prepare a target. A delta prepared at the limit before the
+  prefetcher starts writes the staged deltas in its own pass the same way.
+- Writing staged deltas sooner would not pay. At typical densities they change
+  nearly every block of the files, so writing them costs about as much as
+  copying the checkpoint, and deltas that arrive faster than that would
+  interrupt it.
+- The engine installs a `STAGED` target from its own staged delta. Where it must
+  reload instead, it reads the files with every staged delta since XORed in, so
+  the reload sees the target's bytes.
 - Any other preparation, such as a chain of several deltas, or a caller that
-  needs the target's own files, writes a `STAGED` head into its files first.
-- While files are being rewritten, the head is `UPDATING`, so a crash makes the
-  next initialization rebuild it from its lineage.
-- `perf/mx_receive_delta_apply` is the time of the checking pass, and
-  `perf/mx_receive_delta_rewrite` the time spent rewriting the previous head
-  before a following delta joined the pass.
+  needs the target's own files, writes the staged deltas into the files first.
+- While files are rewritten in place, the head is `UPDATING`, so a crash makes
+  the next initialization rebuild it from its lineage. A crash during a rewrite
+  into a copy leaves the head `STAGED`.
+- `perf/mx_receive_delta_apply` is the time of the checking pass,
+  `perf/mx_receive_staged_layers` the number of deltas staged after it, and
+  `perf/mx_receive_delta_rewrite` the time spent writing staged deltas into the
+  files, by the prefetcher or before a following delta joined the pass.

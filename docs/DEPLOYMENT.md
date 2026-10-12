@@ -1170,7 +1170,12 @@ behavior and the related settings.
 
 `MX_REFIT_INPLACE=true` additionally installs a prepared delta into live vLLM
 weights in place instead of reloading every tensor; see
-[In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install).
+[In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). Deltas are
+installed before the checkpoint files are rewritten, and `MX_REFIT_STAGED_LAYERS`
+(default `8`) bounds how many wait on the files at once. At that limit they are
+written into the files while the engine serves, which for a full checkpoint
+needs room in `refit_checkpoint_max_size_gb` for one more copy of its files; see
+[Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish

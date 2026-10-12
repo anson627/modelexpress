@@ -69,8 +69,9 @@ def _encode_cache_component(value: str) -> str:
 class CheckpointState(str, Enum):
     """Preparation state persisted across receiver processes.
 
-    ``STAGED`` means the target's delta is verified and staged against its base,
-    whose checkpoint files still hold the base's bytes.
+    ``STAGED`` means the target's delta is verified and staged, while the
+    checkpoint files still hold an earlier version, the record's ``base``. The
+    deltas between them in the target's chain are staged too.
     """
 
     READY = "READY"
@@ -86,7 +87,7 @@ class CheckpointRecord:
     version: str
     files: dict[str, list[int]] | None = None
     source: dict[str, str] | None = None
-    # The version whose bytes the checkpoint files hold, for a STAGED version.
+    # The earlier version whose bytes the checkpoint files hold, when STAGED.
     base: str | None = None
 
     @classmethod
@@ -192,7 +193,8 @@ class LocalCheckpointStore:
         # state.json without changing active.json; installation advances
         # active.json only after the engine reload succeeds. A STAGED version
         # is verified and staged but not yet materialized: the checkpoint
-        # files still hold its base.
+        # files still hold an earlier version, and staging holds every delta
+        # since.
         self.cache = Path(root) / _encode_cache_component(model_name)
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"

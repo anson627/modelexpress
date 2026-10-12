@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_INPLACE: bool
+    MX_REFIT_STAGED_LAYERS: int
     MX_REFIT_PREFER_PREPARED: bool
     MX_REFIT_PREFETCH: bool
     MX_REFIT_PREFETCH_POLL_SECONDS: float
@@ -231,6 +232,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_REFIT_INPLACE", "false"),
         "MX_REFIT_INPLACE",
     ),
+    # Most deltas checked through staged bytes before a preparation writes the
+    # checkpoint files.
+    "MX_REFIT_STAGED_LAYERS": lambda: positive_int_env("MX_REFIT_STAGED_LAYERS", 8),
     "RANK": lambda: os.environ.get("RANK"),
 }
 
