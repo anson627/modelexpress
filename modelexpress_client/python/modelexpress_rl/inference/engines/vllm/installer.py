@@ -48,6 +48,7 @@ from modelexpress_rl.inference.engines.vllm.stream_windows import (
 from modelexpress_rl.inference.engines.vllm.inplace import (
     InPlaceInstaller,
     InPlaceUnsupported,
+    Peers,
     xor_into,
     xor_restore,
 )
@@ -591,6 +592,23 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
                     f"{type(layer).__name__}.{name} conflicts with a runtime buffer"
                 )
             layer.register_buffer(name, buffer)
+
+
+def _tensor_parallel_peers() -> Peers | None:
+    """The tensor-parallel ranks of this pipeline stage, which share staged bytes."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+    except (ImportError, AssertionError):
+        return None
+    if group.world_size == 1:
+        return None
+    return Peers(
+        group.rank_in_group,
+        group.world_size,
+        lambda tensor: group.all_gather(tensor, dim=0),
+    )
 
 
 class _VllmInstaller(EngineInstaller):
@@ -1151,6 +1169,7 @@ class _VllmInstaller(EngineInstaller):
                 self._model,
                 device=self._device,
                 generic_reload=lambda load: self._reload(load, xor=True),
+                peers=_tensor_parallel_peers(),
             )
         try:
             metrics = self._inplace.install(checkpoint.path, checkpoint.staging)
