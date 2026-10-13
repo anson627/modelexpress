@@ -615,35 +615,29 @@ engine integrations.
   locking, temporary-directory promotion, atomic JSON persistence, artifact
   fingerprints, and activation state.
 - `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
-  and XOR reconstruction into derived checkpoints. Passes that only check
-  deltas run in `inference/_delta_ext.cpp`, an optional C++ extension that
-  decompresses and checks tensors on its own threads without the GIL; without
-  it, they run in Python.
-- `inference/prefetch.py` owns the optional per-cache background process that
-  prepares new versions before the update pauses the engine, including
-  speculative preparation of unregistered S3 deltas.
+  and XOR reconstruction into derived checkpoints, checking deltas in the
+  optional C++ extension `inference/_delta_ext.cpp` when it is built.
+- `inference/prefetch.py` owns the optional background preparation of new
+  versions outside the serving pause.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
-- `inference/staging.py` owns the staged nonzero XOR bytes of a prepared delta,
-  and `inference/engines/vllm/inplace.py` installs them into live vLLM weights
-  in place by processing the delta like weights and XORing the result.
-  `inference/engines/vllm/sparse_experts.py` writes block-FP8 routed experts
-  sparsely through maps derived from vLLM's own expert loader and kernel
-  conversion.
+- `inference/staging.py` owns a prepared delta's staged nonzero XOR bytes,
+  which `inference/engines/vllm/inplace.py` and
+  `inference/engines/vllm/sparse_experts.py` install into live vLLM weights.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
-leader has reconstructed a target, followers verify and attach to that READY
-checkpoint with shared installation and cache locks. They can therefore prepare
-while another rank loads the same checkpoint. A cache miss releases the shared
-locks, acquires the exclusive installation/cache fences, and rechecks the state
-before reconstructing. Cache-hit attachment performs no eviction; capacity is
-enforced by initialization, reconstruction, and activation.
+leader has reconstructed a target, followers verify and attach to that READY or
+STAGED checkpoint with shared installation and cache locks. They can therefore
+prepare while another rank loads the same checkpoint. A cache miss releases the
+shared locks, acquires the exclusive installation/cache fences, and rechecks the
+state before reconstructing. Cache-hit attachment performs no eviction; capacity
+is enforced by initialization, reconstruction, and activation.
 
 | Canonical checkpoint operation | `.prepare.lock` | `.install.lock` | `.lock` |
 |---|---|---|---|
-| Attach to an already prepared target | Exclusive | Shared | Shared |
+| Attach to an already prepared target | Exclusive, head check only | Shared | Shared |
 | Reconstruct a target | Exclusive | Exclusive | Exclusive |
 | Load engine weights | None | Shared | Shared |
 | Commit activation when the installation context exits | None | Shared | Exclusive |
@@ -1298,9 +1292,10 @@ applies the version through `ModelExpressGeneratorClient`, and
 `finish_weight_update()` releases its staged handle. Each session accepts one
 version; calls before initialization, out-of-order calls, and a second update
 raise instead of reporting success. Orchestrators may repeat
-`init_weight_transfer_engine()` before every update: a repeat for the same model
-returns at once and only asks the background prefetcher to poll, because vLLM
-runs it inside the engine loop. A repeat for another model raises. vLLM's reset hook releases staged resources
+`init_weight_transfer_engine()` before every update: a repeat for the same
+model returns at once and only asks the background prefetcher to poll,
+because vLLM runs it inside the engine loop. A repeat for another model
+raises. vLLM's reset hook releases staged resources
 and clears the session after an update error, including invalid payloads rejected
 before receiving weights. A failed finish retains the session so cleanup can be
 retried; already applied model weights are not rolled back. Draft-model updates remain
