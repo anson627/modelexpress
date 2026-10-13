@@ -8,7 +8,7 @@
 // the checkpoint file only where the delta changes it and updates the base
 // checksum: Adler-32 is linear in the bytes. A full check reads every byte.
 // Bytes of deltas staged on the files are XORed in where they are read.
-// Tensors run on a pool of threads while Python waits with the GIL released.
+// Tensors run on a pool of threads.
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -221,7 +221,7 @@ bool run(const Tensor& tensor, const uint8_t* old, bool sparse, Scratch& scratch
       });
     }
     done += written;
-    if (ended || written < want) {
+    if (ended) {
       break;
     }
   }
@@ -241,7 +241,6 @@ bool run(const Tensor& tensor, const uint8_t* old, bool sparse, Scratch& scratch
 
 void check(const Tensor& tensor, const std::vector<Mapping>& maps, Scratch& scratch, Result& result) {
   const Mapping& map = maps[tensor.file];
-  result.status = kError;
   if (tensor.offset > map.size || tensor.size > map.size - tensor.offset) {
     return;
   }
@@ -262,7 +261,7 @@ void check(const Tensor& tensor, const std::vector<Mapping>& maps, Scratch& scra
   result.status = checksum != tensor.expected ? kMissed : tensor.base >= 0 ? kFallback : kFull;
 }
 
-// Run `work(index)` for each index of `order` on up to `threads` threads.
+// Run `work(index)` for each index of `order` on up to `threads` threads, the caller's among them.
 template <typename Work>
 void parallel(size_t threads, const std::vector<size_t>& order, Work&& work) {
   std::atomic<size_t> next{0};
@@ -272,8 +271,8 @@ void parallel(size_t threads, const std::vector<size_t>& order, Work&& work) {
     }
   };
   std::vector<std::thread> pool;
-  pool.reserve(threads);
-  for (size_t worker = 0; worker < threads; ++worker) {
+  pool.reserve(std::max<size_t>(threads, 1) - 1);
+  for (size_t worker = 1; worker < threads; ++worker) {
     try {
       pool.emplace_back(drain);
     } catch (const std::system_error&) {
@@ -315,48 +314,48 @@ class Views {
   std::vector<Py_buffer> views_;
 };
 
+// Read-only mappings of checkpoint files, unmapped when the call returns.
 class Files {
  public:
   ~Files() {
-    for (size_t index = 0; index < maps_.size(); ++index) {
-      if (maps_[index].data != nullptr) {
-        munmap(const_cast<uint8_t*>(maps_[index].data), maps_[index].size);
+    for (const Mapping& map : maps_) {
+      if (map.data != nullptr) {
+        munmap(const_cast<uint8_t*>(map.data), map.size);
       }
-      close(descriptors_[index]);
     }
   }
 
+  // Map `path`. A mapping stays valid after its descriptor is closed.
   bool open(const char* path) {
     const int descriptor = ::open(path, O_RDONLY | O_CLOEXEC);
-    struct stat info;
-    if (descriptor < 0 || fstat(descriptor, &info) != 0) {
-      if (descriptor >= 0) {
-        ::close(descriptor);
-      }
+    if (descriptor < 0) {
       PyErr_SetFromErrnoWithFilename(PyExc_OSError, path);
       return false;
     }
     Mapping map;
-    map.size = size_t(info.st_size);
+    struct stat info;
+    bool mapped = fstat(descriptor, &info) == 0;
+    map.size = mapped ? size_t(info.st_size) : 0;
     if (map.size > 0) {
       void* data = mmap(nullptr, map.size, PROT_READ, MAP_SHARED, descriptor, 0);
-      if (data == MAP_FAILED) {
-        ::close(descriptor);
-        PyErr_SetFromErrnoWithFilename(PyExc_OSError, path);
-        return false;
-      }
-      map.data = static_cast<const uint8_t*>(data);
+      mapped = data != MAP_FAILED;
+      map.data = mapped ? static_cast<const uint8_t*>(data) : nullptr;
     }
-    maps_.push_back(map);
-    descriptors_.push_back(descriptor);
-    return true;
+    // Set the error first, since close() may change errno.
+    if (!mapped) {
+      PyErr_SetFromErrnoWithFilename(PyExc_OSError, path);
+    }
+    ::close(descriptor);
+    if (mapped) {
+      maps_.push_back(map);
+    }
+    return mapped;
   }
 
   const std::vector<Mapping>& maps() const { return maps_; }
 
  private:
   std::vector<Mapping> maps_;
-  std::vector<int> descriptors_;
 };
 
 using Owned = std::unique_ptr<PyObject, decltype(&Py_DecRef)>;
@@ -463,7 +462,7 @@ PyObject* py_check(PyObject*, PyObject* args) {
   const size_t workers = size_t(std::max<Py_ssize_t>(1, std::min<Py_ssize_t>(threads, Py_ssize_t(count))));
   std::vector<Result> results(count);
   Py_BEGIN_ALLOW_THREADS;
-  parallel(workers - 1, order, [&](size_t index) {
+  parallel(workers, order, [&](size_t index) {
     thread_local Scratch scratch;
     try {
       check(tensors[index], mapped.maps(), scratch, results[index]);
@@ -496,7 +495,7 @@ PyObject* py_check(PyObject*, PyObject* args) {
   auto* position_bytes = reinterpret_cast<uint8_t*>(PyByteArray_AS_STRING(positions.get()));
   auto* value_bytes = reinterpret_cast<uint8_t*>(PyByteArray_AS_STRING(values.get()));
   Py_BEGIN_ALLOW_THREADS;
-  parallel(workers - 1, order, [&](size_t index) {
+  parallel(workers, order, [&](size_t index) {
     Result& result = results[index];
     if (!result.positions.empty()) {
       std::memcpy(position_bytes + starts[index] * sizeof(uint32_t), result.positions.data(),
