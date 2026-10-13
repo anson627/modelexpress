@@ -9,10 +9,12 @@ import hashlib
 import itertools
 import logging
 import json
+import mmap
 import os
 import shutil
 import threading
 import time
+import zlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -42,7 +44,9 @@ from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import (
+    Adler32Change,
     Adler32Checksum,
+    adler32_after_changes,
     checksum_factory,
     index_checkpoint_tensors,
     read_safetensors_header,
@@ -147,13 +151,19 @@ def speculative_version_id(uri: str) -> str:
     return "mx-speculative-" + hashlib.sha256(uri.encode()).hexdigest()[:24]
 
 
-_Decompressor = Callable[[memoryview], Any]
+_Decompressor = Callable[[], Any]
 
 
 # Delta bytes applied per read and write of the checkpoint file. Tensors larger
 # than _SPREAD_TENSOR_BYTES spread their chunks over the apply workers.
 _APPLY_CHUNK_BYTES = 16 << 20
 _SPREAD_TENSOR_BYTES = 256 << 20
+# Sparse checks of tensors up to _BATCH_BYTES run together, up to that many bytes
+# or _BATCH_TENSORS tensors at a time; those up to _SMALL_TENSOR_BYTES decompress
+# in one call each.
+_BATCH_BYTES = 64 << 20
+_BATCH_TENSORS = 4096
+_SMALL_TENSOR_BYTES = 1 << 20
 
 
 def _read_exactly(fd: int, out: memoryview, offset: int) -> None:
@@ -169,6 +179,17 @@ def _write_all(fd: int, data: memoryview, offset: int) -> None:
     done = 0
     while done < len(data):
         done += os.pwritev(fd, [data[done:]], offset + done)
+
+
+def _read_into(reader: Any, out: memoryview) -> memoryview:
+    """Fill ``out`` from a decompressor, or less only at its end; return the part read."""
+    done = 0
+    while done < len(out):
+        read = reader.readinto(out[done:])
+        if not read:
+            break
+        done += read
+    return out[:done]
 
 
 def _read_block(reader: Any, size: int) -> bytes:
@@ -197,6 +218,10 @@ class _TensorPass:
     ``check`` is XORed last, also without writing. With ``checksum``, the result
     must have that checksum. Staging records the nonzero bytes of ``check``, or
     of ``write`` when there is no check.
+
+    ``base_checksum`` is the verified checksum of the bytes ``check`` applies
+    to. With it, a check that writes nothing reads those bytes only where
+    ``check`` changes them, and reads them all only if the checksum misses.
     """
 
     name: str
@@ -205,15 +230,62 @@ class _TensorPass:
     checksum: str | None = None
     scatter: tuple[StagedTensor, ...] = ()
     overlay: tuple[StagedTensor, ...] = ()
+    base_checksum: str | None = None
+
+    @property
+    def sparse(self) -> bool:
+        return (
+            self.base_checksum is not None
+            and self.checksum is not None
+            and self.check is not None
+            and self.write is None
+            and not self.scatter
+        )
 
 
 _Shards = dict[str, tuple[bytes, list[str]]]
 
 
+def _staged_window(staged: StagedTensor, begin: int, end: int) -> tuple[int, int]:
+    """Indices of a staged delta's bytes at tensor offsets ``[begin, end)``."""
+    # Bounds of the offsets' own type keep the search from converting them all.
+    kind = staged.positions.dtype.type
+    first = int(np.searchsorted(staged.positions, kind(begin)))
+    if end >= staged.nbytes:
+        return first, staged.positions.size
+    return first, int(np.searchsorted(staged.positions, kind(end)))
+
+
 def _xor_staged(target: np.ndarray, staged: StagedTensor, position: int) -> None:
     """XOR a staged delta's nonzero bytes into the block of its tensor at ``position``."""
-    begin, end = np.searchsorted(staged.positions, (position, position + target.size))
+    begin, end = _staged_window(staged, position, position + target.size)
     target[staged.positions[begin:end] - position] ^= staged.values[begin:end]
+
+
+def _xor_staged_at(values: np.ndarray, positions: np.ndarray, staged: StagedTensor) -> None:
+    """XOR a staged delta's bytes at the sorted tensor offsets ``positions`` into ``values``."""
+    if not positions.size:
+        return
+    begin, end = _staged_window(staged, int(positions[0]), int(positions[-1]) + 1)
+    if begin == end:
+        return
+    window = staged.positions[begin:end]
+    wanted = positions.astype(window.dtype, copy=False)
+    found = np.minimum(np.searchsorted(window, wanted), window.size - 1)
+    hit = window[found] == wanted
+    values[hit] ^= staged.values[begin:end][found[hit]]
+
+
+def _sparse_base(table: dict[str, str], name: str, *, depth: int) -> str | None:
+    """The checksum a check of ``name`` at chain ``depth`` may start from, if any.
+
+    A tensor sits out one in MX_REFIT_FULL_CHECK_INTERVAL depths, so its check
+    there reads it in full.
+    """
+    interval = rl_envs.MX_REFIT_FULL_CHECK_INTERVAL
+    if interval == 1 or zlib.crc32(name.encode()) % interval == depth % interval:
+        return None
+    return table.get(name)
 
 
 def _staged_tensors(layers: list[StagedDelta]) -> dict[str, tuple[StagedTensor, ...]]:
@@ -225,14 +297,15 @@ def _staged_tensors(layers: list[StagedDelta]) -> dict[str, tuple[StagedTensor, 
     return tensors
 
 
-def _zstd_stream_reader(data: memoryview) -> Any:
+def _zstd_decompressor() -> Any:
     import zstandard
 
-    return zstandard.ZstdDecompressor().stream_reader(data)
+    return zstandard.ZstdDecompressor()
 
 
+# Decompression contexts by format; each opens stream readers one at a time.
 _DECOMPRESSORS: dict[str, _Decompressor] = {
-    "zstd": _zstd_stream_reader,
+    "zstd": _zstd_decompressor,
 }
 
 
@@ -317,8 +390,12 @@ def _download_full_checkpoint(
     root_uri: str,
     protected_versions: set[str],
     tensor_metadata: dict[str, dict] | None = None,
+    checksums: dict[str, str] | None = None,
 ) -> tuple[float, float]:
-    """Download and validate one full HF checkpoint artifact."""
+    """Download and validate one full HF checkpoint artifact.
+
+    ``checksums`` receives each tensor's verified Adler-32.
+    """
     checksum_format = index_metadata.get("checksum_format")
     if tensor_metadata is not None and set(weight_map) != set(tensor_metadata):
         raise ValueError("full HF checkpoint tensor set differs from local checkpoint")
@@ -395,6 +472,8 @@ def _download_full_checkpoint(
                     raise ValueError(
                         f"full HF checkpoint checksum differs for {name!r}"
                     )
+                if checksums is not None and checksum_format == "adler32":
+                    checksums[name] = expected_checksum
         (target / filename).write_bytes(data)
         return download_time, time.perf_counter() - validation_started
 
@@ -487,6 +566,7 @@ def _ensure_full_checkpoint(
         len(index_data),
         protected_versions=protected_versions,
     )
+    checksums: dict[str, str] = {}
     with store.replace_directory(target) as temporary:
         (temporary / Path(version.uri).name).write_bytes(index_data)
         _download_full_checkpoint(
@@ -497,9 +577,12 @@ def _ensure_full_checkpoint(
             weight_map=weight_map,
             root_uri=version.uri,
             protected_versions=protected_versions,
+            checksums=checksums,
         )
         store.record_artifact(temporary, source=source)
     index_checkpoint_tensors(target)
+    if checksums:
+        store.write_checksums(version.version_id, checksums, keep=protected_versions)
 
 
 def bootstrap_s3_checkpoint(
@@ -723,6 +806,7 @@ class _LocalCheckpoint:
         """Restore the immutable initial full checkpoint from the launch seed."""
         state = self.store.state()
         target = self.store.full_path(self.initial_version)
+        self.store.checksums_path(self.initial_version).unlink(missing_ok=True)
         self.store.ensure_capacity(
             self.store.path_size_bytes(self.seed_checkpoint_path),
             protected_versions={self.initial_version},
@@ -990,6 +1074,7 @@ class _LocalCheckpoint:
         else:
             shutil.rmtree(speculative_checkpoint, ignore_errors=True)
         self.store.chain_path(version.version_id).unlink(missing_ok=True)
+        self.store.checksums_path(version.version_id).unlink(missing_ok=True)
         shutil.rmtree(self.store.delta_path(version.version_id), ignore_errors=True)
         shutil.rmtree(self.store.staging_path(version.version_id), ignore_errors=True)
         base = None if files in (None, version.base_version_id) else files
@@ -1382,6 +1467,7 @@ class _LocalCheckpoint:
             protected_versions=protected_versions,
             protected_paths={non_weight_source},
         )
+        checksums: dict[str, str] = {}
         with self.store.replace_directory(target) as temporary:
             self._copy_non_weight_files(non_weight_source, temporary)
             index_name = Path(version.uri).name
@@ -1392,11 +1478,14 @@ class _LocalCheckpoint:
                 weight_map=weight_map,
                 root_uri=version.uri,
                 protected_versions=protected_versions,
+                checksums=checksums,
             )
             self.store.record_artifact(
                 temporary,
                 source=_source_identity(version),
             )
+        if checksums:
+            self.store.write_checksums(version.version_id, checksums, keep=protected_versions)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(
@@ -1505,7 +1594,7 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_shards(shards, index_metadata=metadata, sink=sink)
+            tensors = self._apply_shards(shards, index_metadata=metadata, sink=sink)
         else:
             # The first delta after a full checkpoint copies once so applying
             # it cannot modify the canonical full artifact.
@@ -1514,12 +1603,13 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_shards(shards, index_metadata=metadata, sink=sink)
+                tensors = self._apply_shards(shards, index_metadata=metadata, sink=sink)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
         if sink is not None:
             self._write_staging(version, sink)
+        self._record_checksums(version, self.store.checksums(version.base_version_id), tensors)
         return download_time, time.perf_counter() - apply_started
 
     def _stage_target(
@@ -1559,6 +1649,9 @@ class _LocalCheckpoint:
             started = time.perf_counter()
             self._verify_lineage(chain)
             sink: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+            table = self.store.checksums(state.version)
+            tensors = self._shard_tensors(shards)
+            stats: dict[str, float] = {}
             layers = self._open_layers(state)
             try:
                 self._run_pass(
@@ -1568,17 +1661,20 @@ class _LocalCheckpoint:
                             check=compressed,
                             checksum=checksum,
                             overlay=tuple(layer.tensor(name) for layer in layers if name in layer),
+                            base_checksum=_sparse_base(table, name, depth=len(chain["deltas"])),
                         )
-                        for name, (compressed, checksum) in self._shard_tensors(shards).items()
+                        for name, (compressed, checksum) in tensors.items()
                     ],
                     index_metadata=metadata,
                     sink=sink,
+                    stats=stats,
                 )
             finally:
                 for layer in layers:
                     layer.close()
             self.store.write_chain(version.version_id, chain)
             self._write_staging(version, sink)
+            self._record_checksums(version, table, tensors)
         except CheckpointCacheCapacityError:
             raise
         except Exception as error:
@@ -1593,7 +1689,26 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_index_download": index_download_time,
                 "perf/mx_receive_delta_download": download_time,
                 "perf/mx_receive_delta_apply": time.perf_counter() - started,
+                **{f"perf/mx_receive_delta_{key}": value for key, value in stats.items()},
             },
+        )
+
+    def _record_checksums(
+        self,
+        version: _S3Version,
+        base: dict[str, str],
+        tensors: dict[str, tuple[memoryview, str]],
+    ) -> None:
+        """Record a verified delta's target checksums over its base's ``base`` table.
+
+        Checks start from the head's table, so the base's stays, for a delta that
+        replaces this one, and older ones go.
+        """
+        assert version.base_version_id is not None
+        self.store.write_checksums(
+            version.version_id,
+            {**base, **{name: checksum for name, (_data, checksum) in tensors.items()}},
+            keep=(version.base_version_id,),
         )
 
     def _staged_result(
@@ -1714,7 +1829,16 @@ class _LocalCheckpoint:
         )
         started = time.perf_counter()
         rewrite_seconds = 0.0
-        staged_next: tuple[_S3Manifest, dict[str, tuple[int, np.ndarray, np.ndarray]]] | None = None
+        table = self.store.checksums(head.version_id)
+        stats: dict[str, float] = {}
+        staged_next: (
+            tuple[
+                _S3Manifest,
+                dict[str, tuple[int, np.ndarray, np.ndarray]],
+                dict[str, tuple[memoryview, str]],
+            ]
+            | None
+        ) = None
 
         def rewrite(protected_paths: set[Path]) -> None:
             nonlocal shards, download_time, rewrite_seconds, staged_next
@@ -1764,6 +1888,7 @@ class _LocalCheckpoint:
             metadata = manifest[2]
             assert shards is not None
             checked = self._shard_tensors(shards)
+            depth = len(self._delta_chain(manifest[0])["deltas"])
             sink: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
             self._run_pass(
                 [
@@ -1772,13 +1897,15 @@ class _LocalCheckpoint:
                         scatter=() if name in done else pending.get(name, ()),
                         check=checked[name][0] if name in checked else None,
                         checksum=checked[name][1] if name in checked else None,
+                        base_checksum=_sparse_base(table, name, depth=depth),
                     )
                     for name in (pending.keys() - done) | checked.keys()
                 ],
                 index_metadata=metadata,
                 sink=sink,
+                stats=stats,
             )
-            staged_next = (manifest, sink)
+            staged_next = (manifest, sink, checked)
 
         if reuse_materialized:
             shutil.rmtree(target, ignore_errors=True)
@@ -1810,10 +1937,11 @@ class _LocalCheckpoint:
                 staging=staging,
                 staging_base=staging_base,
             )
-        (version, _index_data, _metadata, _weight_map), sink = staged_next
+        (version, _index_data, _metadata, _weight_map), sink, checked = staged_next
         try:
             self.store.write_chain(version.version_id, self._delta_chain(version))
             self._write_staging(version, sink)
+            self._record_checksums(version, table, checked)
         except CheckpointCacheCapacityError:
             # The head's own rewrite finished, so keep it as READY.
             self.store.write_state(
@@ -1831,6 +1959,7 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_download": download_time,
                 "perf/mx_receive_delta_apply": apply_seconds - rewrite_seconds,
                 "perf/mx_receive_delta_rewrite": rewrite_seconds,
+                **{f"perf/mx_receive_delta_{key}": value for key, value in stats.items()},
             },
         )
 
@@ -1940,6 +2069,7 @@ class _LocalCheckpoint:
         weight_map: dict[str, str],
         root_uri: str,
         protected_versions: set[str],
+        checksums: dict[str, str] | None = None,
     ) -> tuple[float, float]:
         return _download_full_checkpoint(
             s3=self.s3,
@@ -1950,6 +2080,7 @@ class _LocalCheckpoint:
             root_uri=root_uri,
             protected_versions=protected_versions,
             tensor_metadata=self.tensor_metadata,
+            checksums=checksums,
         )
 
     def _shard_tensors(
@@ -1991,16 +2122,21 @@ class _LocalCheckpoint:
         index_metadata: dict[str, Any],
         verify: bool = True,
         sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
-    ) -> None:
-        """XOR delta shards into the checkpoint files, checking target checksums."""
+    ) -> dict[str, tuple[memoryview, str]]:
+        """XOR delta shards into the checkpoint files, checking target checksums.
+
+        Returns each tensor's compressed delta and target checksum.
+        """
+        tensors = self._shard_tensors(shards)
         self._run_pass(
             [
                 _TensorPass(name, write=compressed, checksum=checksum if verify else None)
-                for name, (compressed, checksum) in self._shard_tensors(shards).items()
+                for name, (compressed, checksum) in tensors.items()
             ],
             index_metadata=index_metadata,
             sink=sink,
         )
+        return tensors
 
     def _run_pass(
         self,
@@ -2009,11 +2145,14 @@ class _LocalCheckpoint:
         index_metadata: dict[str, Any],
         sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
         stop: Callable[[], bool] | None = None,
+        stats: dict[str, float] | None = None,
     ) -> set[str]:
         """Run each tensor's XORs over the checkpoint files; return the names done.
 
         ``stop`` is asked before each tensor starts; once it returns True, the
         tensors already started finish and the rest are left as they are.
+        ``stats`` receives how many checks read only changed bytes and how many
+        of those missed and read every byte.
         """
         if not tensors:
             return set()
@@ -2037,9 +2176,27 @@ class _LocalCheckpoint:
             for tensor in row
             if tensor is not None
         ]
+        # Every array operation releases the GIL and takes it back, so threads
+        # checking many small tensors one by one wait mostly on each other.
+        # Sparse checks of tensors in one file run in batches instead, which
+        # share each operation.
+        items: list[_TensorPass | list[_TensorPass]] = []
+        batches: dict[tuple[Path, bool], tuple[list[_TensorPass], list[int]]] = {}
+        for tensor in order:
+            path, _offset, size = self.locations[tensor.name]
+            if not tensor.sparse or size > _BATCH_BYTES:
+                items.append(tensor)
+                continue
+            key = (path, size <= _SMALL_TENSOR_BYTES)
+            batch, total = batches.get(key, (None, [0]))
+            if batch is None or total[0] + size > _BATCH_BYTES or len(batch) >= _BATCH_TENSORS:
+                batch, total = batches[key] = ([], [0])
+                items.append(batch)
+            batch.append(tensor)
+            total[0] += size
         checksum_format = index_metadata["checksum_format"]
-        decompress = _DECOMPRESSORS[index_metadata["compression_format"]]
-        workers = min(rl_envs.MX_REFIT_DELTA_WORKERS, len(order))
+        decompressor = _DECOMPRESSORS[index_metadata["compression_format"]]
+        workers = min(rl_envs.MX_REFIT_DELTA_WORKERS, len(items))
         writes = any(tensor.write is not None or tensor.scatter for tensor in order)
         local = threading.local()
         started: set[str] = set()
@@ -2047,8 +2204,8 @@ class _LocalCheckpoint:
         def apply_chunk(
             fd: int,
             offset: int,
-            write: bytes | None,
-            check: bytes | None,
+            write: memoryview | bytes | None,
+            check: memoryview | bytes | None,
             position: int,
             length: int,
             scatter: tuple[StagedTensor, ...],
@@ -2083,64 +2240,140 @@ class _LocalCheckpoint:
             )
             return checksum, length, nonzero
 
+        def check_chunk(
+            mapped: np.ndarray,
+            offset: int,
+            check: memoryview | bytes,
+            position: int,
+            size: int,
+            overlay: tuple[StagedTensor, ...],
+        ) -> tuple[Adler32Change, int, tuple[np.ndarray, np.ndarray] | None]:
+            """Record how one chunk of a delta changes the bytes it applies to."""
+            positions, values = nonzero_bytes(np.frombuffer(check, dtype=np.uint8), position)
+            old = mapped[offset + positions]
+            for staged in overlay:
+                _xor_staged_at(old, positions, staged)
+            change = Adler32Change(size)
+            change.add(positions, old, old ^ values)
+            return change, len(check), (positions, values) if sink is not None else None
+
+        def decompressors() -> tuple[Any, Any]:
+            """This thread's decompression contexts, for write and check deltas."""
+            found = getattr(local, "decompressors", None)
+            if found is None:
+                found = local.decompressors = (decompressor(), decompressor())
+            return found
+
+        def batch_buffer(length: int) -> np.ndarray:
+            """This thread's buffer for a batch's decompressed deltas."""
+            buffer = getattr(local, "batch", None)
+            if buffer is None or buffer.size < length:
+                buffer = local.batch = np.empty(max(length, _BATCH_BYTES + 1), dtype=np.uint8)
+            return buffer[:length]
+
+        def block_buffer(role: int, length: int) -> memoryview:
+            """This thread's buffer for decompressed blocks of ``role``, 0 write or 1 check."""
+            buffers = getattr(local, "blocks", None)
+            if buffers is None:
+                buffers = local.blocks = (
+                    bytearray(_APPLY_CHUNK_BYTES),
+                    bytearray(_APPLY_CHUNK_BYTES),
+                )
+            return memoryview(buffers[role])[:length]
+
         files: dict[Path, int] = {}
+        # Read-only maps of the files, for checks that read only changed bytes.
+        mapped: dict[Path, np.ndarray] = {}
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="modelexpress-delta-chunk"
         ) as chunks:
 
-            def apply_one(tensor: _TensorPass) -> None:
+            def run(
+                tensor: _TensorPass, sparse: bool
+            ) -> tuple[str | None, list[tuple[np.ndarray, np.ndarray]]]:
+                """Run a tensor's XORs; return its result's checksum and nonzero bytes.
+
+                With ``sparse``, the checksum follows from the base checksum and the
+                bytes the check changes.
+                """
                 path, file_offset, size = self.locations[tensor.name]
-                fd = files[path]
                 checksum = (
-                    checksum_factory(checksum_format) if tensor.checksum is not None else None
+                    checksum_factory(checksum_format)
+                    if tensor.checksum is not None and not sparse
+                    else None
                 )
-                nonzero = []
+                change = Adler32Change(size) if sparse else None
+                nonzero: list[tuple[np.ndarray, np.ndarray]] = []
                 # A large tensor's chunks spread over the workers; others stay here.
                 spread = workers > 1 and size > _SPREAD_TENSOR_BYTES
                 pending: deque[Future] = deque()
 
                 def collect(result) -> None:
                     part, length, part_nonzero = result
-                    if checksum is not None:
+                    if change is not None:
+                        change.merge(part)
+                    elif checksum is not None:
                         checksum.extend(part, length)
                     if part_nonzero is not None:
                         nonzero.append(part_nonzero)
 
+                # A context per tensor would allocate its buffers again each time.
                 readers = [
-                    decompress(compressed) if compressed is not None else None
-                    for compressed in (tensor.write, tensor.check)
+                    context.stream_reader(compressed) if compressed is not None else None
+                    for context, compressed in zip(
+                        decompressors(), (tensor.write, tensor.check), strict=True
+                    )
                 ]
                 position = 0
                 extra = False
                 try:
                     while position < size:
                         length = min(_APPLY_CHUNK_BYTES, size - position)
+                        # A block a worker takes is its own; one used here reuses
+                        # this thread's buffer, which skips allocating it.
                         write, check = (
-                            _read_block(reader, length) if reader is not None else None
-                            for reader in readers
+                            None
+                            if reader is None
+                            else _read_block(reader, length)
+                            if spread
+                            else _read_into(reader, block_buffer(role, length))
+                            for role, reader in enumerate(readers)
                         )
                         blocks = [block for block in (write, check) if block is not None]
                         if blocks:
                             length = len(blocks[0])
                         if not length or any(len(block) != length for block in blocks):
                             break
-                        arguments = (
-                            fd,
-                            file_offset,
-                            write,
-                            check,
-                            position,
-                            length,
-                            tensor.scatter,
-                            tensor.overlay,
-                            checksum is not None,
-                        )
+                        if sparse:
+                            assert check is not None
+                            work: tuple[Any, ...] = (
+                                check_chunk,
+                                mapped[path],
+                                file_offset,
+                                check,
+                                position,
+                                size,
+                                tensor.overlay,
+                            )
+                        else:
+                            work = (
+                                apply_chunk,
+                                files[path],
+                                file_offset,
+                                write,
+                                check,
+                                position,
+                                length,
+                                tensor.scatter,
+                                tensor.overlay,
+                                checksum is not None,
+                            )
                         if spread:
-                            pending.append(chunks.submit(apply_chunk, *arguments))
+                            pending.append(chunks.submit(*work))
                             if len(pending) >= 2 * workers:
                                 collect(pending.popleft().result())
                         else:
-                            collect(apply_chunk(*arguments))
+                            collect(work[0](*work[1:]))
                         position += length
                     if position == size:
                         extra = any(reader is not None and reader.read(1) for reader in readers)
@@ -2155,35 +2388,164 @@ class _LocalCheckpoint:
                     wait(pending)
                 if position != size or extra:
                     raise ValueError(f"canonical delta byte size differs for {tensor.name!r}")
-                # Checksums describe the delta's target, not a reverted base.
-                if checksum is not None and checksum.hexdigest() != tensor.checksum:
-                    raise ValueError(f"canonical target checksum differs for {tensor.name!r}")
+                if change is not None:
+                    assert tensor.base_checksum is not None
+                    return change.apply(tensor.base_checksum), nonzero
+                return (checksum.hexdigest() if checksum is not None else None), nonzero
+
+            def apply_one(tensor: _TensorPass) -> str | None:
+                """Run a tensor's XORs; return "sparse" or "fallback" for a sparse check."""
+                outcome = None
+                if tensor.sparse:
+                    digest, nonzero = run(tensor, sparse=True)
+                    outcome = "sparse" if digest == tensor.checksum else "fallback"
+                    if outcome == "fallback":
+                        # The base checksum is stale, or the delta does not fit the
+                        # bytes; reading them all tells which.
+                        logger.warning(
+                            "Sparse check of %s missed its checksum; reading it in full",
+                            tensor.name,
+                        )
+                if outcome != "sparse":
+                    digest, nonzero = run(tensor, sparse=False)
+                    # Checksums describe the delta's target, not a reverted base.
+                    if tensor.checksum is not None and digest != tensor.checksum:
+                        raise ValueError(
+                            f"canonical target checksum differs for {tensor.name!r}"
+                        )
                 # Staging holds the delta this pass checks or applies, so tensors
                 # it only writes staged bytes into stay out of it.
                 if sink is not None and (tensor.check is not None or tensor.write is not None):
+                    size = self.locations[tensor.name][2]
                     sink[tensor.name] = (size, *join_nonzero(size, nonzero))
+                return outcome
 
-            def scheduled() -> Iterator[_TensorPass]:
-                for tensor in order:
+            def check_batch(batch: list[_TensorPass]) -> list[str | None]:
+                """Sparse-check tensors of one file together; return each one's outcome.
+
+                A tensor whose delta does not decompress to its size in one frame,
+                or whose checksum misses, goes through the single-tensor path.
+                """
+                path = self.locations[batch[0].name][0]
+                sizes = np.array([self.locations[t.name][2] for t in batch], dtype=np.int64)
+                offsets = np.array([self.locations[t.name][1] for t in batch], dtype=np.int64)
+                ends = np.cumsum(sizes)
+                starts = ends - sizes
+                total = int(ends[-1])
+                # One spare byte shows a delta that runs past its tensor's end.
+                buffer = batch_buffer(total + 1)
+                context = decompressors()[1]
+                alone: set[int] = set()
+                if total <= _SMALL_TENSOR_BYTES * len(batch) and sizes.max() <= _SMALL_TENSOR_BYTES:
+                    pieces = []
+                    for index, tensor in enumerate(batch):
+                        try:
+                            data = context.decompress(tensor.check, allow_extra_data=False)
+                        except Exception:
+                            data = b""
+                        if len(data) != sizes[index]:
+                            alone.add(index)
+                            data = bytes(int(sizes[index]))
+                        pieces.append(np.frombuffer(data, dtype=np.uint8))
+                    np.concatenate(pieces, out=buffer[:total])
+                else:
+                    view = memoryview(buffer)
+                    for index, tensor in enumerate(batch):
+                        begin, size = int(starts[index]), int(sizes[index])
+                        reader = context.stream_reader(tensor.check)
+                        try:
+                            read = len(_read_into(reader, view[begin : begin + size + 1]))
+                        except Exception:
+                            read = -1
+                        finally:
+                            reader.close()
+                        if read != size:
+                            alone.add(index)
+                            buffer[begin : begin + size] = 0
+                positions, values = nonzero_bytes(buffer[:total], 0)
+                owner = np.searchsorted(ends, positions, side="right")
+                relative = positions - starts[owner]
+                old = mapped[path][offsets[owner] + relative]
+                # Every staged delta's bytes, in batch offsets, XOR into the old ones.
+                layers = [(index, staged) for index, t in enumerate(batch) for staged in t.overlay]
+                if layers and positions.size:
+                    counts = np.array([staged.positions.size for _index, staged in layers])
+                    where = np.concatenate([staged.positions for _index, staged in layers])
+                    where = where.astype(np.int64) + np.repeat(
+                        starts[[index for index, _staged in layers]], counts
+                    )
+                    sorting = np.argsort(where, kind="stable")
+                    where = where[sorting]
+                    staged_values = np.concatenate([staged.values for _index, staged in layers])
+                    unique, first = np.unique(where, return_index=True)
+                    if unique.size:
+                        combined = np.bitwise_xor.reduceat(staged_values[sorting], first)
+                        found = np.minimum(np.searchsorted(unique, positions), unique.size - 1)
+                        hit = unique[found] == positions
+                        old[hit] ^= combined[found[hit]]
+                digests = adler32_after_changes(
+                    [t.base_checksum or "" for t in batch],
+                    sizes,
+                    owner,
+                    relative,
+                    old,
+                    old ^ values,
+                )
+                bounds = np.searchsorted(owner, np.arange(len(batch) + 1))
+                offsets32 = relative.astype(np.uint32)
+                outcomes: list[str | None] = []
+                for index, tensor in enumerate(batch):
+                    if index in alone or digests[index] != tensor.checksum:
+                        outcomes.append(apply_one(tensor))
+                        continue
+                    if sink is not None:
+                        low, high = int(bounds[index]), int(bounds[index + 1])
+                        sink[tensor.name] = (
+                            int(sizes[index]),
+                            offsets32[low:high],
+                            values[low:high],
+                        )
+                    outcomes.append("sparse")
+                return outcomes
+
+            def apply_item(item: _TensorPass | list[_TensorPass]) -> list[str | None]:
+                return check_batch(item) if isinstance(item, list) else [apply_one(item)]
+
+            def scheduled() -> Iterator[_TensorPass | list[_TensorPass]]:
+                for item in items:
                     if stop is not None and stop():
                         return
-                    started.add(tensor.name)
-                    yield tensor
+                    started.update(
+                        tensor.name for tensor in (item if isinstance(item, list) else [item])
+                    )
+                    yield item
 
             try:
-                for path in by_file:
+                for path, group in by_file.items():
                     files[path] = os.open(path, os.O_RDWR if writes else os.O_RDONLY)
-                list(
-                    threadpool_map(
+                    if any(tensor.sparse for tensor in group):
+                        mapped[path] = np.frombuffer(
+                            mmap.mmap(files[path], 0, access=mmap.ACCESS_READ), dtype=np.uint8
+                        )
+                outcomes = [
+                    outcome
+                    for part in threadpool_map(
                         scheduled(),
-                        apply_one,
+                        apply_item,
                         max_workers=workers,
                         thread_name_prefix="modelexpress-delta-apply",
                     )
-                )
+                    for outcome in part
+                ]
             finally:
+                # A map closes once no array views it.
+                mapped.clear()
                 for descriptor in files.values():
                     os.close(descriptor)
+        if stats is not None:
+            fallbacks = outcomes.count("fallback")
+            stats["sparse_checks"] = stats.get("sparse_checks", 0) + outcomes.count("sparse")
+            stats["sparse_fallbacks"] = stats.get("sparse_fallbacks", 0) + fallbacks
         return started
 
     def _validate_prepared(

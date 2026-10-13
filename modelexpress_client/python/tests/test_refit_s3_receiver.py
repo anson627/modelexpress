@@ -53,8 +53,14 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.runtime import EngineRuntime, GeneratorRuntime
 from modelexpress_rl.inference.session import WeightUpdateSession
 from modelexpress_rl.inference.source import ObjectStorageSourceResolver
+from modelexpress_rl.inference.staging import (
+    StagedDelta,
+    join_nonzero,
+    nonzero_bytes,
+    write_staging,
+)
 from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
-from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
+from modelexpress_rl.utils import Adler32Change, checksum_factory, compress_delta, compute_delta
 
 
 def _checksum(value):
@@ -562,6 +568,10 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(
         load_file(path / "model-00001-of-00001.safetensors")["weight"],
         torch.tensor([7.0, 8.0]),
     )
+    store = checkpoint_store_module.LocalCheckpointStore(
+        root=tmp_path / "cache", model_name="test/model"
+    )
+    assert store.checksums("full-a") == {"weight": _checksum(torch.tensor([7.0, 8.0]).numpy())}
     first_calls = list(storage.calls)
     assert first_calls == [
         "s3://weights/test/v2/model.safetensors.index.json",
@@ -1972,7 +1982,7 @@ def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     def track_apply(shards, *, index_metadata, verify=True, sink=None):
         nonlocal apply_calls
         apply_calls += 1
-        apply_shards(shards, index_metadata=index_metadata, verify=verify)
+        return apply_shards(shards, index_metadata=index_metadata, verify=verify)
 
     @contextmanager
     def track_replace(target, *, copy_from=None):
@@ -2720,6 +2730,18 @@ def test_canonical_s3_accepts_full_checkpoint_without_checksums(
         load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
         target,
     )
+    assert adapter._checkpoint.store.checksums("full-a") == {}
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_canonical_s3_records_verified_full_checkpoint_checksums(monkeypatch, tmp_path):
+    target = torch.tensor([7.0, 8.0])
+    adapter, _storage = _build(monkeypatch, tmp_path, _full_artifact(target))
+
+    staged = adapter.stage_weight(_full_inputs())
+
+    assert adapter._checkpoint.store.checksums("full-a") == {"weight": _checksum(target.numpy())}
     adapter.release_staged_weight(staged)
     adapter.close()
 
@@ -3240,14 +3262,22 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
         def __init__(self, reader):
             self.reader = reader
 
-        def read(self, size):
-            block = self.reader.read(size)
+        def record(self, size, read):
             with read_lock:
                 read_sizes.append(size)
-                if block:
+                if read:
                     thread_id = threading.get_ident()
                     read_counts[thread_id] = read_counts.get(thread_id, 0) + 1
+
+        def read(self, size):
+            block = self.reader.read(size)
+            self.record(size, len(block))
             return block
+
+        def readinto(self, out):
+            read = self.reader.readinto(out)
+            self.record(len(out), read)
+            return read
 
         def close(self):
             self.reader.close()
@@ -3341,6 +3371,21 @@ def test_adler32_checksums_of_parts_combine():
     assert combined.hexdigest() == whole.hexdigest()
 
 
+def test_adler32_of_changed_bytes_follows_from_the_old_checksum():
+    rng = np.random.default_rng(3)
+    data = rng.integers(0, 256, 300_000, dtype=np.uint8)
+    positions = np.sort(rng.choice(data.size, 5_000, replace=False))
+    changed = data.copy()
+    changed[positions] ^= rng.integers(1, 256, positions.size, dtype=np.uint8)
+    whole = Adler32Change(data.size)
+    for part in np.array_split(np.arange(positions.size), 3):
+        piece = Adler32Change(data.size)
+        piece.add(positions[part], data[positions[part]], changed[positions[part]])
+        whole.merge(piece)
+
+    assert whole.apply(_checksum(data)) == _checksum(changed)
+
+
 @pytest.mark.parametrize("wrong_checksum", [False, True])
 def test_large_delta_tensors_spread_their_chunks(monkeypatch, tmp_path, wrong_checksum):
     launch = tmp_path / "launch"
@@ -3403,6 +3448,112 @@ def test_large_delta_tensors_spread_their_chunks(monkeypatch, tmp_path, wrong_ch
         assert nbytes == value.numel()
         assert positions.tolist() == expected.tolist()
         assert values.tolist() == (value ^ base[name]).numpy()[expected].tolist()
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("path", ["single", "small-batch", "large-batch"])
+def test_sparse_checks_agree_with_full_checks_through_staged_deltas(
+    monkeypatch, tmp_path, workers, path
+):
+    rng = np.random.default_rng(5)
+    sizes = {"large": 1000, "small": 40, "unchanged": 24}
+
+    def sparse(size, density):
+        return np.where(rng.random(size) < density, rng.integers(1, 256, size), 0).astype(np.uint8)
+
+    path = tmp_path / "model.bin"
+    files = rng.integers(0, 256, sum(sizes.values()), dtype=np.uint8)
+    files.tofile(path)
+    locations, offset = {}, 0
+    for name, size in sizes.items():
+        locations[name] = (path, offset, size)
+        offset += size
+    head = {name: files[start : start + size].copy() for name, (_p, start, size) in locations.items()}
+    # Two deltas staged on the files, then the delta under check.
+    layers = []
+    for index in range(2):
+        tensors = {}
+        for name, size in sizes.items():
+            xor = sparse(size, 0.2)
+            head[name] ^= xor
+            tensors[name] = (size, *join_nonzero(size, [nonzero_bytes(xor, 0)]))
+        directory = tmp_path / f"layer{index}"
+        directory.mkdir()
+        write_staging(directory, base_version=f"v{index}", tensors=tensors)
+        layers.append(StagedDelta(directory))
+    delta = {name: sparse(size, 0.1 if name != "unchanged" else 0.0) for name, size in sizes.items()}
+    frames = {name: memoryview(compress_delta(xor).tobytes()) for name, xor in delta.items()}
+    checkpoint = receiver_module._LocalCheckpoint.__new__(receiver_module._LocalCheckpoint)
+    checkpoint.locations = locations
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", str(workers))
+    monkeypatch.setattr(receiver_module, "_APPLY_CHUNK_BYTES", 64)
+    monkeypatch.setattr(receiver_module, "_SPREAD_TENSOR_BYTES", 256)
+    if path == "single":
+        monkeypatch.setattr(receiver_module, "_BATCH_BYTES", 0)
+    elif path == "large-batch":
+        monkeypatch.setattr(receiver_module, "_SMALL_TENSOR_BYTES", 0)
+
+    def check(bases):
+        sink, stats = {}, {}
+        checkpoint._run_pass(
+            [
+                receiver_module._TensorPass(
+                    name,
+                    check=frames[name],
+                    checksum=_checksum(head[name] ^ delta[name]),
+                    overlay=tuple(layer.tensor(name) for layer in layers),
+                    base_checksum=bases.get(name),
+                )
+                for name in sizes
+            ],
+            index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
+            sink=sink,
+            stats=stats,
+        )
+        return sink, (stats["sparse_checks"], stats["sparse_fallbacks"])
+
+    full, full_stats = check({})
+    known, known_stats = check({name: _checksum(value) for name, value in head.items()})
+    stale, stale_stats = check({name: "00000001" for name in sizes})
+
+    assert (full_stats, known_stats, stale_stats) == ((0, 0), (3, 0), (0, 3))
+    for name, xor in delta.items():
+        expected = np.flatnonzero(xor)
+        for sink in (full, known, stale):
+            nbytes, positions, values = sink[name]
+            assert nbytes == sizes[name] and positions.tolist() == expected.tolist()
+            assert values.tolist() == xor[expected].tolist()
+    assert np.fromfile(path, dtype=np.uint8).tolist() == files.tolist()
+    for layer in layers:
+        layer.close()
+
+
+@pytest.mark.parametrize("small", [True, False])
+def test_a_batched_delta_that_overruns_its_tensor_is_rejected(monkeypatch, tmp_path, small):
+    path = tmp_path / "model.bin"
+    files = np.arange(48, dtype=np.uint8)
+    files.tofile(path)
+    checkpoint = receiver_module._LocalCheckpoint.__new__(receiver_module._LocalCheckpoint)
+    checkpoint.locations = {"a": (path, 0, 16), "b": (path, 16, 32)}
+    if not small:
+        monkeypatch.setattr(receiver_module, "_SMALL_TENSOR_BYTES", 0)
+    delta = {"a": np.zeros(16, dtype=np.uint8), "b": np.zeros(33, dtype=np.uint8)}
+    delta["a"][3] = 1
+
+    with pytest.raises(ValueError, match="byte size differs for 'b'"):
+        checkpoint._run_pass(
+            [
+                receiver_module._TensorPass(
+                    name,
+                    check=memoryview(compress_delta(delta[name]).tobytes()),
+                    checksum=_checksum(files[start : start + size] ^ delta[name][:size]),
+                    base_checksum=_checksum(files[start : start + size]),
+                )
+                for name, (_path, start, size) in checkpoint.locations.items()
+            ],
+            index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
+            sink={},
+        )
 
 
 def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):

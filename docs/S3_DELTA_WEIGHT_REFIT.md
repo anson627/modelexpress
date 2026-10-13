@@ -55,6 +55,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
 | `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. A delta is verified and installed before the checkpoint files are rewritten. See [In-place install](#in-place-install). |
 | `MX_REFIT_STAGED_LAYERS` | `8` | Most deltas staged on the checkpoint files at once. Below it, a delta is checked through the staged ones without writing; at it, a preparation writes them into the files first. See [Install before rewrite](#install-before-rewrite). |
+| `MX_REFIT_FULL_CHECK_INTERVAL` | `8` | A delta's check reads a tensor with a verified checksum only where the delta changes it, except in one of this many deltas, where it reads the tensor in full. `1` reads every tensor in full. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
@@ -263,7 +264,9 @@ behind.
 
 `full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
 `chains/<version>.json` resolves a version to one full checkpoint plus its
-ordered deltas. The first delta after a full checkpoint copies that immutable
+ordered deltas. `checksums/<version>.json` holds the Adler-32 of each tensor of
+the cache head, and of the version before it, that a download or a delta check
+verified. The first delta after a full checkpoint copies that immutable
 full checkpoint into `materialized/<version>/`, as a reflink clone where the
 filesystem supports it. Later sequential deltas rename the active derived
 checkpoint and apply only the incoming delta in place, so they do not copy the
@@ -310,6 +313,8 @@ preparation from entering before activation.
   chains/
     v0.json
     v1.json
+    v4.json
+  checksums/
     v4.json
   materialized/
     v1/
@@ -800,12 +805,24 @@ stateDiagram-v2
     STAGED --> READY: at the layer limit, write the staged deltas into the files
 ```
 
-- One pass reads the files, XORs in the deltas already staged on them, then
-  XORs the new delta and checks every target checksum, without writing. It
-  stages the new delta's nonzero bytes, and its target becomes the `STAGED`
-  head. The pass costs the same however many deltas are staged, apart from
-  XORing their bytes in memory, so a small delta stays fast after a dense one.
-  A delta that fails its checksums leaves the head unchanged.
+- One pass checks the new delta against the head's bytes, which are the files
+  with the deltas already staged on them XORed in, without writing. It stages
+  the new delta's nonzero bytes, and its target becomes the `STAGED` head. The
+  pass costs the same however many deltas are staged, apart from XORing their
+  bytes in memory, so a small delta stays fast after a dense one. A delta that
+  fails its checksums leaves the head unchanged.
+- Where the head's checksum of a tensor is known, the pass reads the tensor only
+  at the bytes the delta changes. Adler-32 is linear in the bytes, so the old and
+  new bytes there turn the head's checksum into the target's. Other tensors are
+  read in full and XORed, and so is every tensor in one of each
+  `MX_REFIT_FULL_CHECK_INTERVAL` deltas (default 8). A tensor whose sparse check
+  misses is read in full before the delta is rejected. The checked target
+  checksums, over the head's for tensors the delta leaves alone, become the
+  target's table. A verified full download starts the tables; a seed copied from
+  `seed_checkpoint_path` has none, so the first delta reads every tensor it
+  changes. Reading only changed bytes relies on the files staying as ModelExpress
+  wrote them. ModelExpress already rejects files whose size or modification time
+  changed, and the full reads catch other corruption.
 - Deltas stay staged until there are `MX_REFIT_STAGED_LAYERS` of them (default
   8). Once the engine has activated a head at that limit, the prefetcher writes
   its staged deltas into the files, which makes the head `READY`. A delta on top
@@ -831,3 +848,6 @@ stateDiagram-v2
   `perf/mx_receive_staged_layers` the number of deltas staged after it, and
   `perf/mx_receive_delta_rewrite` the time spent writing staged deltas into the
   files, by the prefetcher or before a following delta joined the pass.
+  `perf/mx_receive_delta_sparse_checks` counts the tensors checked at their
+  changed bytes, and `perf/mx_receive_delta_sparse_fallbacks` those whose sparse
+  check missed and were read in full.

@@ -33,11 +33,13 @@ def position_dtype(nbytes: int) -> np.dtype:
 def nonzero_bytes(block: np.ndarray, offset: int) -> tuple[np.ndarray, np.ndarray]:
     """Return absolute offsets and values of the nonzero bytes in one block."""
     # Most 8-byte words of a sparse delta are zero, and finding the nonzero
-    # words first scans an eighth as many elements as finding bytes.
+    # words first scans an eighth as many elements as finding bytes. Numpy
+    # finds the true entries of a boolean mask several times faster than the
+    # nonzero entries of an integer array.
     whole = block.size - block.size % 8
-    words = np.flatnonzero(block[:whole].view(np.uint64))
+    words = np.flatnonzero(block[:whole].view(np.uint64) != 0)
     if 2 * words.size > whole // 8:
-        positions = np.flatnonzero(block)
+        positions = np.flatnonzero(block != 0)
     else:
         rows, columns = np.nonzero(block[:whole].reshape(-1, 8)[words])
         positions = words[rows] * 8 + columns

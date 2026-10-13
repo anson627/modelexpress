@@ -289,10 +289,13 @@ def test_staging_follows_speculation_adoption_and_revert(monkeypatch, tmp_path):
     speculative = receiver_module.speculative_version_id(_uri("v1"))
     checkpoint.prepare_speculative(_delta(speculative, base="base", identity="v1"))
     assert store.staging_path(speculative).exists()
+    assert store.checksums(speculative) == {"weight": _checksum(_bytes([1.0, 3.0]))}
 
     adopted = checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),))
     assert adopted.staging == store.staging_path("v1")
     assert not store.staging_path(speculative).exists()
+    assert store.checksums("v1") == {"weight": _checksum(_bytes([1.0, 3.0]))}
+    assert not store.checksums_path(speculative).exists()
 
     unwanted = receiver_module.speculative_version_id(_uri("x"))
     checkpoint.prepare_speculative(_delta(unwanted, base="v1", identity="x"))
@@ -300,6 +303,8 @@ def test_staging_follows_speculation_adoption_and_revert(monkeypatch, tmp_path):
 
     assert prepared.staging == store.staging_path("y") and prepared.staging_base == "v1"
     assert not store.staging_path(unwanted).exists()
+    assert not store.checksums_path(unwanted).exists()
+    assert store.checksums("y") == {"weight": _checksum(_bytes([1.0, 9.0]))}
 
 
 def test_evicting_a_version_removes_its_staging(monkeypatch, tmp_path):
@@ -442,6 +447,103 @@ def test_a_delta_on_a_staged_head_is_checked_through_the_staged_deltas(monkeypat
     assert _staged_target(prepared) == _LINEAGE["v3"]
     follower = _checkpoint(tmp_path, s3, initialize=False)
     assert follower.prepare_chain((_lineage_delta("v3"),), staged=True).overlay == prepared.overlay
+
+
+def _target_checksums(version):
+    return {name: _checksum(_bytes(values)) for name, values in _LINEAGE[version].items()}
+
+
+def _sparse(prepared):
+    return (
+        prepared.metrics["perf/mx_receive_delta_sparse_checks"],
+        prepared.metrics["perf/mx_receive_delta_sparse_fallbacks"],
+    )
+
+
+def test_a_delta_reads_only_its_changed_bytes_from_known_checksums(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    # No tensor sits out a sparse check at these chain depths.
+    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
+    store = checkpoint.store
+
+    first = checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True)
+    # The seed's bytes were never checked, so v1 reads them all.
+    assert _sparse(first) == (0, 0)
+    assert store.checksums("v1") == {"a": _target_checksums("v1")["a"]}
+    checkpoint.activate(first)
+    second = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+    # a has v1's checksum, and b, unchanged since the seed, has none.
+    assert _sparse(second) == (1, 0)
+    assert store.checksums("v2") == _target_checksums("v2")
+    checkpoint.activate(second)
+    third = checkpoint.prepare_chain((_lineage_delta("v3"),), staged=True)
+
+    assert _sparse(third) == (1, 0)
+    assert third.overlay == tuple(store.staging_path(v) for v in ("v1", "v2", "v3"))
+    assert _staged_target(third) == _LINEAGE["v3"]
+    assert store.checksums("v3") == _target_checksums("v3")
+    staged = StagedDelta(store.staging_path("v3"))
+    xor = np.bitwise_xor(_bytes(_LINEAGE["v2"]["a"]), _bytes(_LINEAGE["v3"]["a"]))
+    assert staged.tensor("a").positions.tolist() == np.flatnonzero(xor).tolist()
+    staged.close()
+    # Older versions' tables go, and the head's stays for a delta that replaces v3.
+    assert not store.checksums_path("v1").exists()
+    assert store.checksums_path("v2").exists()
+
+
+def test_a_stale_checksum_falls_back_to_reading_the_tensor(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
+    store = checkpoint.store
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    store.write_checksums("v1", {"a": "00000001"})
+
+    prepared = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+
+    assert _sparse(prepared) == (0, 1)
+    assert _staged_target(prepared) == _LINEAGE["v2"]
+    assert store.checksums("v2") == _target_checksums("v2")
+
+
+def test_a_wrong_delta_fails_after_its_sparse_check_misses(monkeypatch, tmp_path):
+    checkpoint, s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    shard = safetensors.numpy.load(s3.objects[f"{PREFIX}/v2/{SHARD}"])
+    checksums = {**_target_checksums("v2"), "a": "00000001"}
+    s3.objects[f"{PREFIX}/v2/{SHARD}"] = safetensors.numpy.save(shard, metadata=checksums)
+
+    with pytest.raises(RuntimeError, match="checksum differs for 'a'"):
+        checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+
+    state = checkpoint.store.state()
+    assert (state.status, state.version) == (CheckpointState.STAGED, "v1")
+    assert not checkpoint.store.checksums_path("v2").exists()
+
+
+@pytest.mark.parametrize("interval", [1, 2])
+def test_each_tensor_is_read_in_full_once_per_check_interval(monkeypatch, tmp_path, interval):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", str(interval))
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    second = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+    checkpoint.activate(second)
+    third = checkpoint.prepare_chain((_lineage_delta("v3"),), staged=True)
+
+    # a changes at depths 2 and 3, and one of every `interval` depths reads it all.
+    assert _sparse(second)[0] + _sparse(third)[0] == 2 - 2 // interval
+    assert _staged_target(third) == _LINEAGE["v3"]
+
+
+def test_a_delta_joined_to_a_rewrite_records_its_checksums(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch, layers=2)
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True))
+
+    prepared = checkpoint.prepare_chain((_lineage_delta("v3"),), staged=True)
+
+    assert prepared.path == checkpoint.store.materialized_path("v2")
+    assert checkpoint.store.checksums("v3") == _target_checksums("v3")
 
 
 def test_at_the_layer_limit_a_delta_writes_the_staged_deltas_in_its_pass(monkeypatch, tmp_path):

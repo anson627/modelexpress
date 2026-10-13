@@ -184,6 +184,7 @@ class LocalCheckpointStore:
         #     chains/<version>.json     full ancestor plus ordered deltas
         #     materialized/<version>/   derived, installable full checkpoints
         #     staging/<version>/        derived nonzero XOR bytes of one delta
+        #     checksums/<version>.json  verified Adler-32 of a version's tensors
         #     state.json                current preparation transaction
         #     speculation.json          unregistered target being prepared ahead
         #     want.json                 target an engine waits to prepare
@@ -206,6 +207,7 @@ class LocalCheckpointStore:
         self.chain_cache = self.cache / "chains"
         self.materialized_cache = self.cache / "materialized"
         self.staging_cache = self.cache / "staging"
+        self.checksum_cache = self.cache / "checksums"
         self.state_path = self.cache / "state.json"
         self.speculation_path = self.cache / "speculation.json"
         self.active_path = self.cache / "active.json"
@@ -223,6 +225,7 @@ class LocalCheckpointStore:
             self.chain_cache,
             self.materialized_cache,
             self.staging_cache,
+            self.checksum_cache,
         ):
             path.mkdir(exist_ok=True)
 
@@ -312,6 +315,25 @@ class LocalCheckpointStore:
 
     def chain_path(self, version: str) -> Path:
         return self.chain_cache / f"{_encode_cache_component(version)}.json"
+
+    def checksums_path(self, version: str) -> Path:
+        return self.checksum_cache / f"{_encode_cache_component(version)}.json"
+
+    def checksums(self, version: str) -> dict[str, str]:
+        """Verified checksums of a version's tensors, as far as they are known."""
+        table = self._read_json(self.checksums_path(version)) or {}
+        return {name: value for name, value in table.items() if isinstance(value, str)}
+
+    def write_checksums(
+        self, version: str, table: dict[str, str], *, keep: Iterable[str] = ()
+    ) -> None:
+        """Record a version's verified checksums, dropping other versions' not in ``keep``."""
+        self.checksum_cache.mkdir(exist_ok=True)
+        self._write_json(self.checksums_path(version), table)
+        kept = {self.checksums_path(name).name for name in (version, *keep)}
+        for path in self.checksum_cache.glob("*.json"):
+            if path.name not in kept:
+                path.unlink(missing_ok=True)
 
     @staticmethod
     def path_size_bytes(path: Path) -> int:
@@ -573,6 +595,9 @@ class LocalCheckpointStore:
         old_chain = self.chain_path(old)
         if old_chain.exists():
             old_chain.replace(self.chain_path(new))
+        old_checksums = self.checksums_path(old)
+        if old_checksums.exists():
+            old_checksums.replace(self.checksums_path(new))
 
     def chain(self, version: str) -> dict | None:
         return self._read_json(self.chain_path(version))

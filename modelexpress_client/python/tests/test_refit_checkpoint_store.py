@@ -265,6 +265,24 @@ def test_store_owns_the_versioned_layout_and_state(tmp_path):
     assert store.active_version() == "base/a"
 
 
+def test_store_keeps_checksum_tables_of_the_versions_it_is_told_to(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    store.write_checksums("v1", {"a": "00000001"})
+    store.write_checksums("v2", {"a": "00000002", "b": 3}, keep=("v1",))
+
+    assert store.checksums("v1") == {"a": "00000001"}
+    # Only strings are checksums.
+    assert store.checksums("v2") == {"a": "00000002"}
+    assert store.checksums("missing") == {}
+    store.rename_version("v2", "v2/registered")
+    assert store.checksums("v2/registered") == {"a": "00000002"}
+    assert not store.checksums_path("v2").exists()
+    store.write_checksums("v3", {}, keep=())
+    assert not store.checksums_path("v1").exists()
+    assert not store.checksums_path("v2/registered").exists()
+
+
 def test_store_encodes_dot_path_components(tmp_path):
     store = LocalCheckpointStore(root=tmp_path, model_name="..")
     store.initialize()
