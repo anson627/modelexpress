@@ -428,8 +428,11 @@ usage changes. It evicts stale derived materializations before stale canonical
 artifacts, but never evicts the active lineage or the checkpoint being prepared
 or installed. Capacity must therefore cover the active checkpoint plus the
 rollback-safe working set for one update. Each step of a preparation checks
-for room before it changes the checkpoint files, so a capacity rejection leaves
-the cache head READY at the version they hold, and a later update can retry. A
+for room before it changes the checkpoint files, so a capacity rejection
+restores the cache head it started from, `READY` or `STAGED`, or the last
+version it finished, and a later update can retry. If making room evicted that
+head's files or staged deltas, the head stays `UPDATING` for recovery to
+rebuild. A
 delta written into the files without room for its staged bytes still prepares,
 and installs by reloading instead of in place. On initialization, the
 configured seed is restored as the initial full artifact and becomes the active

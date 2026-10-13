@@ -61,6 +61,7 @@ from modelexpress_rl.inference.staging import (
 )
 from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
 from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
+from tests.refit_fixtures import _delta, _delta_snapshot, _FakeS3
 
 
 def _checksum(value):
@@ -1108,6 +1109,55 @@ def test_canonical_s3_preserves_active_checkpoint_when_disk_is_full(
     assert staged.path == store.full_path("full-a")
     adapter.release_staged_weight(staged)
     adapter.close()
+
+
+def test_a_full_cache_does_not_restore_a_staged_head_without_its_deltas(
+    monkeypatch, tmp_path
+):
+    objects = _full_artifact(torch.tensor([9.0, 9.0]), version_label=7)
+    objects.update(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
+    objects.update(_delta_snapshot([1.0, 3.0], [4.0, 3.0], identity="v2", base_identity="v1"))
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=_FakeS3(objects),
+        stage_deltas=True,
+    )
+    checkpoint.initialize()
+    store = checkpoint.store
+    checkpoint.activate(checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),)))
+    checkpoint.prepare_chain((_delta("v2", base="v1", identity="v2"),), staged=True)
+    assert store.state().status is checkpoint_store_module.CheckpointState.STAGED
+    full = receiver_module._S3Version(
+        version_id="full-a",
+        base_version_id=None,
+        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        uri="s3://weights/test/v7/model.safetensors.index.json",
+    )
+
+    # Making room for a full checkpoint evicts the staged head's delta, then fails.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            checkpoint_store_module.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(free=0),
+        )
+        with pytest.raises(RuntimeError):
+            checkpoint.prepare_chain((full,), staged=True)
+
+    assert not store.staging_path("v2").exists()
+    assert store.state().status is checkpoint_store_module.CheckpointState.UPDATING
+    checkpoint.recover_incomplete_preparation()
+    state = store.state()
+    assert (state.status, state.version) == (checkpoint_store_module.CheckpointState.READY, "base")
 
 
 def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path):

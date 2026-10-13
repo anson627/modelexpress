@@ -1343,7 +1343,10 @@ class _LocalCheckpoint:
                     source=_source_identity(version),
                 )
         except CheckpointCacheCapacityError:
+            # If eviction took the head's files or staged deltas, these raise and
+            # leave the state UPDATING, for recovery to rebuild.
             self._set_local_checkpoint(self.store.checkpoint_path(restore.files_version))
+            self._overlay(restore)
             self.store.write_state(
                 status=restore.status,
                 version=restore.version,
