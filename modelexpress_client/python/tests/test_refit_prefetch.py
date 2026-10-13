@@ -543,6 +543,25 @@ def test_a_rewrite_does_not_join_a_speculative_delta_that_failed_from_its_head(
     assert _files(checkpoint) == {"weight": [1.0, 3.0]}
 
 
+def test_a_rewrite_does_not_join_a_wanted_delta_that_failed_from_its_head(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "_WANTED_CHECK_SECONDS", 0.0)
+    _s3, checkpoint, refit, prefetcher = _setup(
+        tmp_path, {**_v1_snapshot(), **_v2_snapshot()}, staged=True
+    )
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+    prefetcher.poll_once()
+    checkpoint.store.activate("v1")
+    checkpoint.store.write_wanted(_wanted("v2", "v1", "run-v000002"))
+    following = prefetcher._following(checkpoint.store.state())
+    assert following()[0].version_id == "v2"
+
+    # Once v2 failed from v1, the engine waiting for it does not make a rewrite join it.
+    prefetcher._failed.add(("v2", "v1"))
+    assert following() is None
+
+
 def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path):
     _s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot(), staged=True)
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
