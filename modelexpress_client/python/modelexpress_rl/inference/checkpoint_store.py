@@ -197,10 +197,7 @@ class LocalCheckpointStore:
         # lineage. Materialized checkpoints are rebuildable outputs for engines
         # that require an ordinary checkpoint directory. Preparation updates
         # state.json without changing active.json; installation advances
-        # active.json only after the engine reload succeeds. A STAGED version
-        # is verified and staged but not yet materialized: the checkpoint
-        # files still hold an earlier version, and staging holds every delta
-        # since.
+        # active.json only after the engine reload succeeds.
         self.cache = Path(root) / _encode_cache_component(model_name)
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
@@ -230,8 +227,6 @@ class LocalCheckpointStore:
             path.mkdir(exist_ok=True)
 
         with self.locked():
-            # Writers fill a temporary directory while they hold this lock, so
-            # one found here was left by a process that stopped mid-write.
             for root in (
                 self.full_cache,
                 self.delta_cache,

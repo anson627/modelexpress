@@ -106,9 +106,6 @@ class StagedDelta:
 
     def __init__(self, directory: Path) -> None:
         index = json.loads((directory / INDEX_FILE).read_text())
-        self.base_version: str = json.loads((directory / BASE_FILE).read_text())[
-            "base_version"
-        ]
         self._names: list[str] = index["names"]
         self._rows = {name: row for row, name in enumerate(self._names)}
         self._nbytes = np.asarray(index["nbytes"], dtype=np.int64)
@@ -218,10 +215,11 @@ def _starts(sizes: np.ndarray) -> np.ndarray:
 
 
 __all__ = [
+    "POSITIONS_FILE",
+    "VALUES_FILE",
     "StagedDelta",
     "StagedTensor",
     "join_nonzero",
     "nonzero_bytes",
-    "position_dtype",
     "write_staging",
 ]
