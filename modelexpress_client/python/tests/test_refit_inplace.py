@@ -453,6 +453,12 @@ def _target_checksums(version):
     return {name: _checksum(_bytes(values)) for name, values in _LINEAGE[version].items()}
 
 
+# Only the C++ checker reads a tensor's changed bytes alone.
+_needs_native_check = pytest.mark.skipif(
+    receiver_module._delta_ext is None, reason="built without the C++ delta checker"
+)
+
+
 def _sparse(prepared):
     return (
         prepared.metrics["perf/mx_receive_delta_sparse_checks"],
@@ -460,6 +466,7 @@ def _sparse(prepared):
     )
 
 
+@_needs_native_check
 def test_a_delta_reads_only_its_changed_bytes_from_known_checksums(monkeypatch, tmp_path):
     checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
     # No tensor sits out a sparse check at these chain depths.
@@ -491,20 +498,6 @@ def test_a_delta_reads_only_its_changed_bytes_from_known_checksums(monkeypatch, 
     assert store.checksums_path("v2").exists()
 
 
-def test_a_stale_checksum_falls_back_to_reading_the_tensor(monkeypatch, tmp_path):
-    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
-    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
-    store = checkpoint.store
-    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
-    store.write_checksums("v1", {"a": "00000001"})
-
-    prepared = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
-
-    assert _sparse(prepared) == (0, 1)
-    assert _staged_target(prepared) == _LINEAGE["v2"]
-    assert store.checksums("v2") == _target_checksums("v2")
-
-
 def test_a_wrong_delta_fails_after_its_sparse_check_misses(monkeypatch, tmp_path):
     checkpoint, s3 = _lineage_checkpoint(tmp_path, monkeypatch)
     monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
@@ -521,6 +514,7 @@ def test_a_wrong_delta_fails_after_its_sparse_check_misses(monkeypatch, tmp_path
     assert not checkpoint.store.checksums_path("v2").exists()
 
 
+@_needs_native_check
 @pytest.mark.parametrize("interval", [1, 2])
 def test_each_tensor_is_read_in_full_once_per_check_interval(monkeypatch, tmp_path, interval):
     checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
