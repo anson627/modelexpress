@@ -478,17 +478,21 @@ def _active_version(store: LocalCheckpointStore) -> str | None:
 def _protected_versions(
     store: LocalCheckpointStore,
     *versions: str,
+    head: bool = False,
 ) -> set[str]:
     """Return versions excluded from cache eviction during this operation.
 
     Callers supply the operation's working set. The installed version is also
-    retained so recovery can rebuild from the checkpoint backing the engine.
+    retained so recovery can rebuild from the checkpoint backing the engine,
+    and with ``head``, so is the cache head.
     """
     protected = set(versions)
     active = _active_version(store)
     if active is not None:
         protected.add(active)
     state = store.state()
+    if head and state is not None:
+        protected.add(state.version)
     # A STAGED version's bytes are its base's files plus the staged deltas.
     if state is not None and state.base is not None and state.version in protected:
         protected.add(state.base)
@@ -587,10 +591,7 @@ def bootstrap_s3_checkpoint(
     store.initialize()
     target = store.full_path(version.version_id)
     with store.installation_locked(), store.locked():
-        protected_versions = _protected_versions(store, version.version_id)
-        state = store.state()
-        if state is not None:
-            protected_versions.add(state.version)
+        protected_versions = _protected_versions(store, version.version_id, head=True)
         _ensure_full_checkpoint(
             store=store,
             target=target,
