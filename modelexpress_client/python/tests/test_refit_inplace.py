@@ -562,8 +562,6 @@ def test_a_rewrite_that_fails_in_a_copy_leaves_the_head_staged(monkeypatch, tmp_
     assert _staged_target(following) == _LINEAGE["v2"]
 
 
-
-
 def test_a_rewrite_joins_a_delta_that_appears_while_it_runs(monkeypatch, tmp_path):
     # At the layer limit, the files are rewritten in place and the delta joins the pass.
     checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch, layers=1)
@@ -729,7 +727,10 @@ class _Exchange:
             self._barrier.wait()
             return gathered
 
-        return inplace_module.Peers(rank, self.size, all_gather)
+        def agree(flags):
+            return all_gather(flags).view(self.size, -1).amin(0)
+
+        return inplace_module.Peers(rank, self.size, all_gather, agree)
 
 
 @pytest.mark.parametrize("size", [2, 3])
@@ -975,7 +976,9 @@ def test_expert_layers_install_from_one_reader(monkeypatch, tmp_path):
 def test_a_rank_that_fails_an_expert_layer_still_gathers_every_run(monkeypatch, tmp_path):
     model, checkpoint, staged, _deltas = _expert_layers(monkeypatch, tmp_path)
     gathered = []
-    peers = inplace_module.Peers(0, 1, lambda tensor: gathered.append(tensor.numel()) or tensor)
+    peers = inplace_module.Peers(
+        0, 1, lambda tensor: gathered.append(tensor.numel()) or tensor, lambda flags: flags
+    )
     cpu = torch.device("cpu")
     inplace_module.InPlaceInstaller(
         model, device=cpu, generic_reload=lambda load: None, peers=peers
@@ -1001,7 +1004,7 @@ def test_a_rank_that_fails_an_expert_layer_still_gathers_every_run(monkeypatch, 
 def test_peers_write_an_expert_layer_sparsely_only_if_all_of_them_can():
     # A peer whose shard of layer 5 has no sparse layout.
     installer = SimpleNamespace(
-        _agree=lambda flags: flags * torch.tensor([1, 0, 1], dtype=torch.int32)
+        _peers=SimpleNamespace(agree=lambda flags: flags * torch.tensor([1, 0, 1], dtype=torch.int32))
     )
 
     layouts = inplace_module.InPlaceInstaller._agreed_layouts(
@@ -1222,9 +1225,7 @@ class _InPlace:
     calls = []
     error = None
 
-    def __init__(
-        self, model, *, device, generic_reload, agree, peers
-    ):
+    def __init__(self, model, *, device, generic_reload, peers):
         pass
 
     def install(self, path, staging, *, overlay=(), reload_values=None):
@@ -1292,5 +1293,3 @@ def test_in_place_install_replaces_the_reload(staged_checkpoint, monkeypatch):
     assert reloaded == []
     assert metrics["perf/mx_receive_inplace_expert_layers"] == 2.0
     assert installer._live_version == "v2"
-
-
