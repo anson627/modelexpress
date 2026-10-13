@@ -8,7 +8,8 @@ delta like weights and XORing the result into live storage gives the same bytes
 as a reload of the target. Constant parts of processing cancel because zeros are
 processed as well. Routed experts take a batched path from the staged bytes;
 every other changed tensor goes through the layerwise reload with the final copy
-replaced by an XOR.
+replaced by an XOR. Modules whose processing changes values, such as FP8 linear
+layers under DeepGEMM, reload from the target's values instead.
 """
 
 from __future__ import annotations
@@ -761,8 +762,8 @@ class InPlaceInstaller:
         self._sparse = sparse_experts.SparseExperts(device)
         # Expert layers sparse writes cannot install, with the reason last logged.
         self._sparse_rejected: dict[int, str] = {}
-        # Per checkpoint layout: whether each generic tensor's module needs its values.
-        self._needs_values: tuple[dict[str, dict], dict[str, bool]] | None = None
+        # Whether each generic tensor's module needs its values, reset with the catalog.
+        self._needs_values: dict[str, bool] = {}
         self._packed: dict[str, list[str]] = {}
         for module in model.modules():
             self._packed.update(getattr(module, "packed_modules_mapping", None) or {})
@@ -1032,28 +1033,24 @@ class InPlaceInstaller:
         self, changed: list[str], catalog: CheckpointCatalog, metadata: dict[str, dict]
     ) -> set[str]:
         """Generic tensors of the modules whose processing changes the values of changed tensors."""
-        if self._needs_values is None or self._needs_values[0] is not metadata:
-            self._needs_values = (metadata, {})
-        known = self._needs_values[1]
+        known = self._needs_values
         needed = []
         for name in changed:
             if name in catalog.per_expert:
                 continue
             if name not in known:
-                known[name] = self._needs_value(name, metadata, self._packed)
+                known[name] = self._needs_value(name, metadata)
             if known[name]:
                 needed.append(name)
         return module_groups(needed, catalog.generic, self._packed) if needed else set()
 
-    def _needs_value(
-        self, name: str, metadata: dict[str, dict], packed: dict[str, list[str]]
-    ) -> bool:
+    def _needs_value(self, name: str, metadata: dict[str, dict]) -> bool:
         indexer = _INDEXER.search(name)
         if indexer and metadata.get(f"{indexer[1]}.wk.weight", {}).get("dtype", "").startswith("F8"):
             # vLLM dequantizes an FP8 wk into the indexer's fused weight while loading.
             return True
         try:
-            module = self._model.get_submodule(checkpoint_module(name, packed))
+            module = self._model.get_submodule(checkpoint_module(name, self._packed))
         except AttributeError:
             # An FP8 tensor whose module is unknown may not install bit for bit.
             return metadata[name]["dtype"].startswith("F8") or name.endswith("weight_scale_inv")
@@ -1063,6 +1060,7 @@ class InPlaceInstaller:
         # The checkpoint index returns the same metadata while headers are unchanged.
         if self._catalog is None or self._catalog[0] is not metadata:
             self._catalog = (metadata, CheckpointCatalog.of(metadata))
+            self._needs_values = {}
         return self._catalog[1]
 
     def _served(self, key: int | None) -> bool:
