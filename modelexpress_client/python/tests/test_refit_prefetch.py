@@ -31,7 +31,11 @@ from modelexpress_rl import (
 from modelexpress_rl.inference import client as client_module
 from modelexpress_rl.inference import prefetch as prefetch_module
 from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.checkpoint_store import CheckpointState, LocalCheckpointStore
+from modelexpress_rl.inference.checkpoint_store import (
+    CheckpointCacheCapacityError,
+    CheckpointState,
+    LocalCheckpointStore,
+)
 from modelexpress_rl.inference.client import ModelExpressGeneratorClient
 from modelexpress_rl.inference.methods import CanonicalDeltaUpdateMethod
 from modelexpress_rl.inference.session import WeightUpdateSession
@@ -344,6 +348,44 @@ def test_a_failed_preparation_is_left_to_the_engine(tmp_path):
     assert len(s3.gets) == downloads
     status = json.loads((checkpoint.store.cache / prefetch_module.STATUS_FILE).read_text())
     assert (status["phase"], status["version"]) == ("failed", "v1")
+
+
+def test_a_full_cache_keeps_the_head_a_preparation_started_from(monkeypatch, tmp_path):
+    objects = {
+        **_delta_snapshot(
+            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+        ),
+        **_delta_snapshot(
+            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
+        ),
+        **_delta_snapshot(
+            [4.0, 3.0], [4.0, 5.0], identity="run-v000003", base_identity="run-v000002"
+        ),
+    }
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects)
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+    assert prefetcher.poll_once() == "v1"
+    checkpoint.store.activate("v1")
+    refit.add("v2", payload=XOR, base="v1", uri=_uri("run-v000002"), created=3)
+    # While the engine serves v1, its files become v2's.
+    assert prefetcher.poll_once() == "v2"
+
+    def full(self, additional_bytes, **kwargs):
+        raise CheckpointCacheCapacityError("checkpoint cache is full")
+
+    worker = _checkpoint(tmp_path, s3, initialize=False)
+    chain = (
+        _delta("v2", base="v1", identity="run-v000002"),
+        _delta("v3", base="v2", identity="run-v000003"),
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(LocalCheckpointStore, "ensure_capacity", full)
+        with pytest.raises(CheckpointCacheCapacityError):
+            worker.prepare_chain(chain)
+
+    state = checkpoint.store.state()
+    assert (state.status, state.version) == (CheckpointState.READY, "v2")
+    assert torch.equal(_weight(worker.prepare_chain(chain)), torch.tensor([4.0, 5.0]))
 
 
 def test_a_streaming_engine_prepares_full_checkpoints_itself(tmp_path):
