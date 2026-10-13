@@ -596,6 +596,27 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
             layer.register_buffer(name, buffer)
 
 
+# vLLM's DeepSeek-V3.2 and GLM loaders buffer an FP8 indexer wk and its scale
+# here until both arrive. The buffer outlives load_weights, so a stale entry
+# would pair with the wrong tensor.
+_PENDING_FP8_INDEXER_WK = "_pending_indexer_wk_fp8"
+
+
+def _clear_pending_fp8_indexer_wk(model: Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        logger.warning("Discarding stale FP8 indexer wk entries before reload: %s", sorted(pending))
+        pending.clear()
+
+
+def _require_no_pending_fp8_indexer_wk(model: Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        raise IncompleteRefit(
+            f"FP8 indexer wk weight and scale pairs left pending after reload: {sorted(pending)}"
+        )
+
+
 def _with_staged_deltas(
     tensors: Iterable[tuple[str, torch.Tensor]], overlay: Sequence[Path]
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -1206,17 +1227,28 @@ class _VllmInstaller(EngineInstaller):
                 peers=_tensor_parallel_peers(),
             )
         try:
-            metrics = self._inplace.install(checkpoint.path, checkpoint.staging)
+            metrics = self._inplace.install(
+                checkpoint.path,
+                checkpoint.staging,
+                overlay=checkpoint.overlay,
+                # Modules whose processing changes values reload from the target.
+                reload_values=lambda names: self.install_changed_tensors(
+                    checkpoint.path, frozenset(names), overlay=checkpoint.overlay
+                ),
+            )
         except InPlaceUnsupported as error:
             # Anything already XORed belongs to a changed module, which the
             # reload below rewrites from the prepared checkpoint.
             logger.warning("In-place install unavailable, reloading instead: %s", error)
             return None
         logger.info(
-            "In-place install version=%s expert_layers=%d generic_tensors=%d seconds=%.3f",
+            "In-place install version=%s expert_layers=%d sparse_expert_layers=%d "
+            "generic_tensors=%d value_tensors=%d seconds=%.3f",
             checkpoint.target_version,
             int(metrics["perf/mx_receive_inplace_expert_layers"]),
+            int(metrics["perf/mx_receive_inplace_sparse_expert_layers"]),
             int(metrics["perf/mx_receive_inplace_generic_tensors"]),
+            int(metrics["perf/mx_receive_inplace_value_tensors"]),
             metrics["perf/mx_receive_inplace_time"],
         )
         return metrics
@@ -1610,7 +1642,9 @@ class _VllmInstaller(EngineInstaller):
             initialize_layerwise_reload(self._model)
             self._restore_parameter_aliases(load_aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
+            _clear_pending_fp8_indexer_wk(self._model)
             load(load_aliases)
+            _require_no_pending_fp8_indexer_wk(self._model)
             finalize_layerwise_reload(self._model, self._model_config)
             self._validate_alias_owners(aliases)
 
