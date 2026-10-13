@@ -3451,10 +3451,12 @@ def test_large_delta_tensors_spread_their_chunks(monkeypatch, tmp_path, wrong_ch
 
 
 @pytest.mark.parametrize("workers", [1, 4])
-@pytest.mark.parametrize("path", ["single", "small-batch", "large-batch"])
+@pytest.mark.parametrize("path", ["native", "single", "small-batch", "large-batch"])
 def test_sparse_checks_agree_with_full_checks_through_staged_deltas(
     monkeypatch, tmp_path, workers, path
 ):
+    if path == "native" and receiver_module._delta_ext is None:
+        pytest.skip("built without the C++ delta checker")
     rng = np.random.default_rng(5)
     sizes = {"large": 1000, "small": 40, "unchanged": 24}
 
@@ -3488,6 +3490,7 @@ def test_sparse_checks_agree_with_full_checks_through_staged_deltas(
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", str(workers))
     monkeypatch.setattr(receiver_module, "_APPLY_CHUNK_BYTES", 64)
     monkeypatch.setattr(receiver_module, "_SPREAD_TENSOR_BYTES", 256)
+    monkeypatch.setenv("MX_REFIT_NATIVE_CHECK", str(path == "native").lower())
     if path == "single":
         monkeypatch.setattr(receiver_module, "_BATCH_BYTES", 0)
     elif path == "large-batch":
@@ -3529,7 +3532,9 @@ def test_sparse_checks_agree_with_full_checks_through_staged_deltas(
 
 
 @pytest.mark.parametrize("small", [True, False])
-def test_a_batched_delta_that_overruns_its_tensor_is_rejected(monkeypatch, tmp_path, small):
+@pytest.mark.parametrize("native", [True, False])
+def test_a_batched_delta_that_overruns_its_tensor_is_rejected(monkeypatch, tmp_path, small, native):
+    monkeypatch.setenv("MX_REFIT_NATIVE_CHECK", str(native).lower())
     path = tmp_path / "model.bin"
     files = np.arange(48, dtype=np.uint8)
     files.tofile(path)

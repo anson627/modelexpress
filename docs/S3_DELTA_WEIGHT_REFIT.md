@@ -56,6 +56,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. A delta is verified and installed before the checkpoint files are rewritten. See [In-place install](#in-place-install). |
 | `MX_REFIT_STAGED_LAYERS` | `8` | Most deltas staged on the checkpoint files at once. Below it, a delta is checked through the staged ones without writing; at it, a preparation writes them into the files first. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_FULL_CHECK_INTERVAL` | `8` | A delta's check reads a tensor with a verified checksum only where the delta changes it, except in one of this many deltas, where it reads the tensor in full. `1` reads every tensor in full. See [Install before rewrite](#install-before-rewrite). |
+| `MX_REFIT_NATIVE_CHECK` | `true` | Check deltas in the C++ delta checker when the client was built with it. `false` checks them in Python. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
@@ -823,6 +824,13 @@ stateDiagram-v2
   changes. Reading only changed bytes relies on the files staying as ModelExpress
   wrote them. ModelExpress already rejects files whose size or modification time
   changed, and the full reads catch other corruption.
+- The checks run in a C++ extension when the client was built with it, which
+  decompresses and checks tensors on `MX_REFIT_DELTA_WORKERS` threads without
+  the GIL. A delta it cannot decompress to its tensor's size goes through the
+  Python check, which reports it. Without the extension, or with
+  `MX_REFIT_NATIVE_CHECK=false`, the checks run in Python, where the sparse
+  checks of one file's tensors run in batches. At 64 workers on 8xB300,
+  checking GLM-5.3's deltas took 7.5-8 s natively and 18-22 s in Python.
 - Deltas stay staged until there are `MX_REFIT_STAGED_LAYERS` of them (default
   8). Once the engine has activated a head at that limit, the prefetcher writes
   its staged deltas into the files, which makes the head `READY`. A delta on top
