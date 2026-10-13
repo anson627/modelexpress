@@ -777,12 +777,13 @@ flowchart LR
   once per node rather than once per rank. Every other changed tensor goes
   through the layerwise reload with the final copy replaced by an XOR. That
   reload materializes each layer as zeros, so elements no loader writes, such
-  as padding rows, keep their live values. Its inputs are built on the GPU when
-  it has room for twice the largest of them and 1 GiB, rather than as host
-  arrays. vLLM holds every input of a module it cannot complete, such as one
-  with padding rows, until the reload ends, so a dense delta can need far more:
-  Kimi K3's held over 31 GiB per rank and ran out of GPU memory at
-  `--gpu-memory-utilization` 0.8.
+  as padding rows, keep their live values. Its inputs are built on the GPU
+  while they fit in the memory free when the install starts, less one of the
+  largest inputs and 1 GiB, and in host memory once they do not. vLLM holds a
+  module's inputs until the module is complete, and those of a module it cannot
+  complete, such as one with padding rows, until the reload ends. Kimi K3 pads
+  its KDA input projections, and on a dense delta their held inputs need more
+  than 31 GiB per rank.
 - Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, the default
   on Blackwell in the vLLM versions tested, take sparse writes instead. That
   backend stores each expert's weights as a byte permutation of its checkpoint
@@ -817,7 +818,8 @@ flowchart LR
   through the layerwise reload. `perf/mx_receive_inplace_expert_wait_time` is
   the part of the expert time spent waiting for staged bytes to be read, and
   `perf/mx_receive_inplace_input_time` the part of the generic time spent
-  building the reload's inputs. `perf/mx_receive_inplace_sparse_expert_layers`,
+  building the reload's inputs, `perf/mx_receive_inplace_host_input_bytes` the
+  bytes of those built in host memory. `perf/mx_receive_inplace_sparse_expert_layers`,
   `perf/mx_receive_inplace_sparse_expert_bytes` and
   `perf/mx_receive_inplace_sparse_scale_tensors` count the sparse writes, and
   `perf/mx_receive_inplace_sparse_layout_time` the time spent deriving their

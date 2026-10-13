@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 import torch
 from modelexpress.gds_loader import SAFETENSORS_DTYPE_MAP
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from modelexpress_rl.inference.engines.vllm import sparse_experts
 from modelexpress_rl.inference.engines.vllm.surgical import checkpoint_module, module_groups
@@ -146,6 +147,43 @@ def staged_bytes(
             offsets = device_offsets(staged.positions[start : start + chunk], device)
             data[offsets] = torch.from_numpy(staged.values[start : start + chunk]).to(device)
     return data
+
+
+# GPU memory left for what a reload allocates itself, beyond one of its largest inputs.
+_INPUT_RESERVE = 1 << 30
+
+
+class InputBudget:
+    """Places reload inputs on the GPU while they fit in its free memory, else on the host.
+
+    vLLM holds a module's inputs until the module is complete, and the inputs of
+    one it cannot complete, such as one with padding rows, until the reload ends.
+    Free memory is measured once, since querying it can be slow; whether an input
+    is still held is read from its storage instead.
+    """
+
+    def __init__(self, device: torch.device, room: int) -> None:
+        self._device = device
+        self._room = room
+        self._held: list[tuple[StorageWeakRef, int]] = []
+        self._held_bytes = 0
+        self.host_bytes = 0
+
+    def device(self, nbytes: int) -> torch.device:
+        """The device to build an input of ``nbytes`` on."""
+        if self._held_bytes + nbytes > self._room:
+            self._held = [(ref, size) for ref, size in self._held if not ref.expired()]
+            self._held_bytes = sum(size for _ref, size in self._held)
+        if self._held_bytes + nbytes <= self._room:
+            return self._device
+        self.host_bytes += nbytes
+        return torch.device("cpu")
+
+    def hold(self, tensor: torch.Tensor) -> None:
+        """Count ``tensor`` against the room until nothing references its storage."""
+        if tensor.device.type != "cpu":
+            self._held.append((StorageWeakRef(tensor.untyped_storage()), tensor.nbytes))
+            self._held_bytes += tensor.nbytes
 
 
 @dataclass(frozen=True)
@@ -918,7 +956,7 @@ class InPlaceInstaller:
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
-        fed, input_seconds = self._install_generic(
+        fed, input_seconds, host_input_bytes = self._install_generic(
             staged,
             [name for name in changed if name not in values],
             catalog,
@@ -945,6 +983,7 @@ class InPlaceInstaller:
             "perf/mx_receive_inplace_sparse_layout_time": layout_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
             "perf/mx_receive_inplace_input_time": input_seconds,
+            "perf/mx_receive_inplace_host_input_bytes": float(host_input_bytes),
             "perf/mx_receive_inplace_generic_time": generic_seconds,
             "perf/mx_receive_inplace_value_tensors": float(len(values)),
             "perf/mx_receive_inplace_value_time": time.perf_counter() - value_started,
@@ -1103,11 +1142,12 @@ class InPlaceInstaller:
         metadata: dict[str, dict],
         *,
         excluded: set[str],
-    ) -> tuple[int, float]:
+    ) -> tuple[int, float, int]:
         """Reload every tensor of each changed non-expert group with XOR restore.
 
         The reload feeds none of the ``excluded`` tensors. Returns how many it
-        fed and the seconds spent building their inputs.
+        fed, the seconds spent building their inputs, and the bytes of inputs
+        built in host memory.
         """
         groups = {catalog.layers[name] for name in changed if name not in catalog.per_expert}
         fed = [
@@ -1116,7 +1156,7 @@ class InPlaceInstaller:
             if catalog.layers[name] in groups and name not in excluded
         ]
         if not fed:
-            return 0, 0.0
+            return 0, 0.0, 0
         unknown = sorted({metadata[name]["dtype"] for name in fed} - SAFETENSORS_DTYPE_MAP.keys())
         if unknown:
             raise InPlaceUnsupported(f"unsupported checkpoint dtypes {unknown}")
@@ -1127,7 +1167,7 @@ class InPlaceInstaller:
         # They then hold the loaded value rather than an XOR of it.
         originals = {name: tensor.detach().clone() for name, tensor in live.items()}
 
-        device = self._input_device(max(metadata[name]["byte_size"] for name in fed))
+        budget = self._input_budget(max(metadata[name]["byte_size"] for name in fed))
         input_seconds = 0.0
 
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
@@ -1136,7 +1176,8 @@ class InPlaceInstaller:
                 info = metadata[name]
                 started = time.perf_counter()
                 delta = None if zero or name not in staged_names else staged.tensor(name)
-                data = staged_bytes(info["byte_size"], delta, device)
+                data = staged_bytes(info["byte_size"], delta, budget.device(info["byte_size"]))
+                budget.hold(data)
                 input_seconds += time.perf_counter() - started
                 yield name, data.view(SAFETENSORS_DTYPE_MAP[info["dtype"]]).view(info["shape"])
 
@@ -1153,7 +1194,7 @@ class InPlaceInstaller:
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=False)))
         for name, original in changed_live.items():
             xor_into(live[name].data, original)
-        return len(fed), input_seconds
+        return len(fed), input_seconds, budget.host_bytes
 
     def _agreed_layouts(
         self, expert_layers: list[int], layouts: dict[int, sparse_experts.ExpertLayout]
@@ -1169,19 +1210,19 @@ class InPlaceInstaller:
         agreed = self._peers.agree(flags).tolist()
         return {index: layouts[index] for index, flag in zip(expert_layers, agreed) if flag}
 
-    def _input_device(self, nbytes: int) -> torch.device:
-        """Build reload inputs on the GPU when it has room for a few of the largest.
+    def _input_budget(self, largest: int) -> InputBudget:
+        """A budget for reload inputs from the GPU memory free now.
 
         Host inputs cost page faults and a host-to-device copy of every byte.
-        Asked once for both reloads of an install, since querying free memory can be slow.
+        Measured once for both reloads of an install, since querying free memory can be slow.
         """
         if self._device.type != "cuda":
-            return torch.device("cpu")
+            return InputBudget(torch.device("cpu"), 0)
         free, _total = torch.cuda.mem_get_info(self._device)
         cached = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
             self._device
         )
-        return self._device if free + cached > 2 * nbytes + (1 << 30) else torch.device("cpu")
+        return InputBudget(self._device, free + cached - largest - _INPUT_RESERVE)
 
     def _live_tensors(self, groups: set[int | None]) -> dict[str, torch.Tensor]:
         """Parameters and buffers of the changed groups, except routed experts."""
@@ -1251,6 +1292,7 @@ __all__ = [
     "CheckpointCatalog",
     "InPlaceInstaller",
     "InPlaceUnsupported",
+    "InputBudget",
     "Peers",
     "StagedPlacement",
     "StagedRunReader",
