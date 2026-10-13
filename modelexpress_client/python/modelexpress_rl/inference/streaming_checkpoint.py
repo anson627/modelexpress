@@ -253,10 +253,7 @@ class _CheckpointWriter:
         logger.info("Streamed checkpoint cache started version=%s", version)
         try:
             with store.installation_locked(), store.locked():
-                protected = _protected_versions(store, version)
-                state = store.state()
-                if state is not None:
-                    protected.add(state.version)
+                protected = _protected_versions(store, version, head=True)
                 headers = self._headers()
                 size = len(checkpoint.index_data) + sum(map(len, headers.values()))
                 size += sum(

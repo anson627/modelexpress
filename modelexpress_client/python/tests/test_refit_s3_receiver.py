@@ -3800,3 +3800,70 @@ def test_malformed_delta_lineage_falls_back(monkeypatch, tmp_path, index):
     assert adapter._checkpoint._delta_changes("target-b") == ()
     adapter.release_staged_weight(staged)
     adapter.close()
+
+
+def test_bootstrap_keeps_the_bytes_of_a_staged_head_that_is_not_active(monkeypatch, tmp_path):
+    objects = {
+        "s3://weights/root/model.safetensors.index.json": json.dumps(
+            {"metadata": {}, "weight_map": {"weight": "model-00001-of-00001.safetensors"}}
+        ).encode()
+    }
+    for version, base, before, after in (
+        ("v1", "base", [1.0, 2.0], [1.0, 3.0]),
+        ("v2", "v1", [1.0, 3.0], [4.0, 3.0]),
+        ("v3", "v2", [4.0, 3.0], [4.0, 5.0]),
+    ):
+        objects.update(_delta_snapshot(before, after, identity=version, base_identity=base))
+    s3 = _FakeS3(objects)
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=s3,
+        stage_deltas=True,
+    )
+    checkpoint.initialize()
+    store = checkpoint.store
+    checkpoint.activate(checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),)))
+    v2 = checkpoint.prepare_chain((_delta("v2", base="v1", identity="v2"),), staged=True)
+    checkpoint.activate(v2)
+    checkpoint.prepare_chain((_delta("v3", base="v2", identity="v3"),), staged=True)
+    state = store.state()
+    assert (state.status, state.version, state.base) == (
+        checkpoint_store_module.CheckpointState.STAGED,
+        "v3",
+        "v1",
+    )
+    root = receiver_module._S3Version(
+        version_id="root",
+        base_version_id=None,
+        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        uri="s3://weights/root/model.safetensors.index.json",
+    )
+
+    # Without room for the root, the bootstrap evicts all it does not protect.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            checkpoint_store_module.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(free=0),
+        )
+        with pytest.raises(checkpoint_store_module.CheckpointCacheCapacityError):
+            receiver_module.bootstrap_s3_checkpoint(
+                model_name="test/model",
+                version=root,
+                refit_checkpoint_dir=tmp_path / "cache",
+                s3=s3,
+            )
+
+    # The head's files still hold v1, with v2 and v3 staged on them.
+    prepared = checkpoint.prepare_chain((_delta("v3", base="v2", identity="v3"),), staged=True)
+    assert prepared.path == store.materialized_path("v1")
+    assert prepared.overlay == (store.staging_path("v2"), store.staging_path("v3"))

@@ -432,7 +432,8 @@ for room before it changes the checkpoint files, so a capacity rejection
 restores the cache head it started from, `READY` or `STAGED`, or the last
 version it finished, and a later update can retry. If making room evicted that
 head's files or staged deltas, the head stays `UPDATING` for recovery to
-rebuild. A
+rebuild. A cold-start bootstrap and a streamed full checkpoint keep the cache
+head, and a `STAGED` head's files and staged deltas, out of eviction. A
 delta written into the files without room for its staged bytes still prepares,
 and installs by reloading instead of in place. On initialization, the
 configured seed is restored as the initial full artifact and becomes the active
