@@ -254,6 +254,7 @@ class RefitPrefetcher:
             or wanted.get("base_version") != head
             or not isinstance(wanted.get("version"), str)
             or not isinstance(wanted.get("uri"), str)
+            or (wanted["version"], head) in self._failed
         ):
             return None
         return _S3Version(
