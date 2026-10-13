@@ -107,12 +107,12 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         """Initialize ModelExpress from the rank-local vLLM model context."""
         if self._closed:
             raise RuntimeError("weight transfer engine is shut down")
+        model_name = (
+            init_info.model_name
+            if init_info.model_name is not None
+            else self._model_name
+        )
         if self._client is not None:
-            model_name = (
-                init_info.model_name
-                if init_info.model_name is not None
-                else self._model_name
-            )
             if model_name != self._client.model_name:
                 raise RuntimeError(
                     "weight transfer engine is already initialized for model "
@@ -163,11 +163,6 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 region_name=init_info.object_storage_region_name,
             )
 
-        model_name = (
-            init_info.model_name
-            if init_info.model_name is not None
-            else self._model_name
-        )
         self._client = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=self._engine_context,
