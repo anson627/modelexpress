@@ -1213,8 +1213,7 @@ class _VllmInstaller(EngineInstaller):
     ) -> dict[str, float] | None:
         """XOR a staged delta into live weights, or return None to reload instead."""
         if (
-            not rl_envs.MX_REFIT_INPLACE
-            or checkpoint.staging is None
+            checkpoint.staging is None
             or live_version is None
             or checkpoint.staging_base != live_version
         ):

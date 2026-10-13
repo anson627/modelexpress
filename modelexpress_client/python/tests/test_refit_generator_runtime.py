@@ -473,22 +473,29 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
 
 
 @pytest.mark.parametrize(
+    "setting,capability,argument",
+    [
+        ("MX_REFIT_FULL_STREAMING", "streamed_checkpoints", "stream_full_checkpoints"),
+        ("MX_REFIT_INPLACE", "staged_checkpoints", "staged_checkpoints"),
+    ],
+)
+@pytest.mark.parametrize(
     "enabled,supported,expected",
     [(False, True, False), (True, False, False), (True, True, True)],
 )
-def test_streaming_requires_opt_in_and_engine_capability(
-    monkeypatch, tmp_path, enabled, supported, expected
+def test_checkpoint_modes_require_opt_in_and_engine_capability(
+    monkeypatch, tmp_path, setting, capability, argument, enabled, supported, expected
 ):
     from dataclasses import replace
     from unittest.mock import Mock
     from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
 
-    monkeypatch.setenv("MX_REFIT_FULL_STREAMING", str(enabled))
+    monkeypatch.setenv(setting, str(enabled))
     engine = _full_tensor_engine()
     installer = Mock(
         capabilities=EngineCapabilities(
             artifact_types=frozenset({PreparedCheckpointArtifact}),
-            streamed_checkpoints=supported,
+            **{capability: supported},
         )
     )
     monkeypatch.setattr(
@@ -515,5 +522,5 @@ def test_streaming_requires_opt_in_and_engine_capability(
         service=lambda: object(),
         start_lease=lambda version: object(),
     )
-    assert constructor.call_args.kwargs["stream_full_checkpoints"] is expected
+    assert constructor.call_args.kwargs[argument] is expected
     runtime.close()

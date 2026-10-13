@@ -163,6 +163,8 @@ _APPLY_CHUNK_BYTES = 16 << 20
 _SPREAD_TENSOR_BYTES = 256 << 20
 # The C++ checker's offsets are 32-bit.
 _NATIVE_TENSOR_BYTES = 1 << 32
+# A delta's check reads each tensor in full in one of this many chain depths.
+_FULL_CHECK_INTERVAL = 8
 # Outcomes of the C++ checker's checks.
 _NATIVE_SPARSE, _NATIVE_FULL, _NATIVE_FALLBACK, _NATIVE_MISSED, _NATIVE_ERROR = range(5)
 
@@ -253,11 +255,10 @@ def _xor_staged(target: np.ndarray, staged: StagedTensor, position: int) -> None
 def _sparse_base(table: dict[str, str], name: str, *, depth: int) -> str | None:
     """The checksum a check of ``name`` at chain ``depth`` may start from, if any.
 
-    A tensor sits out one in MX_REFIT_FULL_CHECK_INTERVAL depths, so its check
-    there reads it in full.
+    A tensor sits out one in _FULL_CHECK_INTERVAL depths, so its check there
+    reads it in full.
     """
-    interval = rl_envs.MX_REFIT_FULL_CHECK_INTERVAL
-    if interval == 1 or zlib.crc32(name.encode()) % interval == depth % interval:
+    if zlib.crc32(name.encode()) % _FULL_CHECK_INTERVAL == depth % _FULL_CHECK_INTERVAL:
         return None
     return table.get(name)
 
@@ -612,7 +613,11 @@ def bootstrap_s3_checkpoint(
 
 
 class _LocalCheckpoint:
-    """Immutable local artifacts plus a materialized install checkpoint."""
+    """Immutable local artifacts plus a materialized install checkpoint.
+
+    With ``stage_deltas``, for an engine that installs deltas in place,
+    preparations stage each delta's nonzero bytes.
+    """
 
     def __init__(
         self,
@@ -620,9 +625,11 @@ class _LocalCheckpoint:
         model_name: str,
         config: ObjectStorageGeneratorConfig,
         s3: S3Client,
+        stage_deltas: bool = False,
     ) -> None:
         self.initial_version = config.initial_base_version_id
         self.s3 = s3
+        self.stage_deltas = stage_deltas
         self.store = LocalCheckpointStore(
             root=config.refit_checkpoint_dir,
             model_name=model_name,
@@ -1287,7 +1294,7 @@ class _LocalCheckpoint:
         first = manifests[0][0] if manifests else None
         if (
             staged
-            and rl_envs.MX_REFIT_INPLACE
+            and self.stage_deltas
             and len(manifests) == 1
             and first is not None
             and first.payload_format is WeightPayloadFormat.XOR_DELTA
@@ -1552,7 +1559,7 @@ class _LocalCheckpoint:
         target = self.store.materialized_path(version.version_id)
         apply_started = time.perf_counter()
         sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = (
-            {} if rl_envs.MX_REFIT_INPLACE else None
+            {} if self.stage_deltas else None
         )
         self._verify_lineage(chain)
         base_checkpoint = self.store.checkpoint_path(version.base_version_id)
@@ -1979,7 +1986,7 @@ class _LocalCheckpoint:
 
     def _staged_from(self, version_id: str) -> tuple[Path | None, str | None]:
         """Return the staged delta into a version and its base, if staged."""
-        if not rl_envs.MX_REFIT_INPLACE:
+        if not self.stage_deltas:
             return None, None
         staging = self.store.staging_path(version_id)
         base = StagedDelta.base_of(staging)

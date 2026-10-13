@@ -58,6 +58,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 model_name=model_name,
                 config=config,
                 s3=self._s3,
+                stage_deltas=staged_checkpoints,
             )
             self._initialized = self._checkpoint.initialize(
                 allow_unrecorded_seed=True,
@@ -194,6 +195,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                             seed_checkpoint_path=seed,
                         ),
                         s3=self._s3,
+                        stage_deltas=self._staged_checkpoints,
                     )
                     checkpoint.initialize()
                     self._checkpoint = checkpoint

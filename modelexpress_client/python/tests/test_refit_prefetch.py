@@ -154,11 +154,12 @@ def _config(tmp_path):
     )
 
 
-def _checkpoint(tmp_path, s3, *, initialize=True):
+def _checkpoint(tmp_path, s3, *, initialize=True, stage_deltas=False):
     checkpoint = receiver_module._LocalCheckpoint(
         model_name="test/model",
         config=_config(tmp_path),
         s3=s3,
+        stage_deltas=stage_deltas,
     )
     if initialize:
         checkpoint.initialize()
@@ -200,7 +201,7 @@ def _weight(prepared):
 
 def _setup(tmp_path, objects, *, s3_watch=False, staged=False):
     s3 = _FakeS3(objects)
-    checkpoint = _checkpoint(tmp_path, s3)
+    checkpoint = _checkpoint(tmp_path, s3, stage_deltas=staged)
     refit = _FakeRefit()
     refit.add("base", payload=FULL, uri=_uri("run-v000000"), created=1)
     prefetcher = prefetch_module.RefitPrefetcher(
@@ -467,7 +468,6 @@ def _head_weight(checkpoint):
 def test_staged_prefetch_rewrites_a_head_at_the_layer_limit_once_the_engine_serves_it(
     monkeypatch, tmp_path
 ):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "1")
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
@@ -490,7 +490,6 @@ def test_staged_prefetch_rewrites_a_head_at_the_layer_limit_once_the_engine_serv
 
 
 def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     monkeypatch.setattr(prefetch_module, "_WANTED_CHECK_SECONDS", 0.0)
     objects = {
         **_delta_snapshot(
@@ -541,7 +540,6 @@ def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
 
 def test_a_rewrite_reports_the_delta_it_prepared(monkeypatch, tmp_path):
     # One staged delta is the limit, so the delta joins the rewrite.
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "1")
     monkeypatch.setattr(prefetch_module, "_WANTED_CHECK_SECONDS", 0.0)
     objects = {
@@ -577,7 +575,6 @@ def test_a_rewrite_reports_the_delta_it_prepared(monkeypatch, tmp_path):
 
 
 def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
     )
@@ -599,12 +596,11 @@ def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path)
 
 
 def test_an_engine_announces_the_target_it_waits_to_prepare(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
     )
     s3, checkpoint, _refit, _prefetcher = _setup(tmp_path, objects, staged=True)
-    engine = _checkpoint(tmp_path, s3, initialize=False)
+    engine = _checkpoint(tmp_path, s3, initialize=False, stage_deltas=True)
     store = checkpoint.store
 
     with ThreadPoolExecutor(max_workers=1) as pool:

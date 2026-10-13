@@ -50,12 +50,10 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
 | `MX_REFIT_PREFETCH` | `false` | Prepare new versions in a background process before the update pauses the engine. See [Background prefetch](#background-prefetch). |
 | `MX_REFIT_PREFETCH_S3_WATCH` | `false` | Also prepare deltas found in S3 before their versions are registered. Requires `MX_REFIT_PREFETCH`. |
-| `MX_REFIT_PREFETCH_POLL_SECONDS` | `2` | How often the prefetcher checks for new versions. |
 | `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
 | `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
 | `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. A delta is verified and installed before the checkpoint files are rewritten. See [In-place install](#in-place-install). |
 | `MX_REFIT_STAGED_LAYERS` | `8` | Most deltas staged on the checkpoint files at once. Below it, a delta is checked through the staged ones without writing; at it, a preparation writes them into the files first. See [Install before rewrite](#install-before-rewrite). |
-| `MX_REFIT_FULL_CHECK_INTERVAL` | `8` | A delta's check reads a tensor with a verified checksum only where the delta changes it, except in one of this many deltas, where it reads the tensor in full. `1` reads every tensor in full. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_NATIVE_CHECK` | `true` | Check deltas in the C++ delta checker when the client was built with it. `false` checks them in Python. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
@@ -816,9 +814,9 @@ stateDiagram-v2
   `MX_REFIT_DELTA_WORKERS` threads without the GIL. Where the head's checksum of
   a tensor is known, it reads the tensor only at the bytes the delta changes:
   Adler-32 is linear in the bytes, so the old and new bytes there turn the head's
-  checksum into the target's. It reads other tensors in full, as it does every
-  tensor in one of each `MX_REFIT_FULL_CHECK_INTERVAL` deltas (default 8), and a
-  tensor whose sparse check misses before it rejects the delta. Without the
+  checksum into the target's. It reads other tensors in full, as it does each
+  tensor in one of every eight deltas, and a tensor whose sparse check misses
+  before it rejects the delta. Without the
   extension, or with `MX_REFIT_NATIVE_CHECK=false`, Python reads every tensor in
   full, several times slower.
 - The checked target checksums, over the head's for tensors the delta leaves
