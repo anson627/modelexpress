@@ -8,6 +8,7 @@ import dataclasses
 import errno
 import functools
 import json
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -1160,6 +1161,50 @@ def test_processing_a_delta_leaves_the_kernel_on_live_storage(monkeypatch):
     assert layer.w13_weight is live and live.tolist() == [5, 5]
     assert layer.quant_method.kernel_weight is live
     assert not hasattr(layer, "extra")
+
+
+def test_xor_restore_leaves_elements_no_loader_writes_unchanged(monkeypatch):
+    # Reload materializes tensors uninitialized, here as all-ones memory.
+    def materialize(meta_tensor):
+        return torch.full(meta_tensor.shape, -1, dtype=meta_tensor.dtype)
+
+    def place(layer, info):
+        delattr(layer, "weight")
+        layer.register_parameter("weight", info.kernel_tensors[0]["weight"])
+
+    _fake_modules(
+        monkeypatch,
+        {
+            "vllm.model_executor.model_loader.reload.layerwise": {
+                "_copy_and_restore_kernel_tensors": None,
+                "_place_kernel_tensors": place,
+            },
+            "vllm.model_executor.model_loader.reload.meta": {"materialize_meta_tensor": materialize},
+        },
+    )
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    meta = sys.modules["vllm.model_executor.model_loader.reload.meta"]
+    live = torch.nn.Parameter(torch.tensor([1, 2, 3, 0], dtype=torch.int32), requires_grad=False)
+    layer = torch.nn.Module()
+    layer.register_parameter("weight", live)
+    info = SimpleNamespace(
+        kernel_tensors=({"weight": live}, {}),
+        kernel_non_persistent_buffers=set(),
+        loaded_weights=[("weight", None)],
+    )
+
+    with inplace_module.xor_restore():
+        # Like vLLM's layer processing: materialize the layer, load every row but
+        # the padding one, then restore the live tensors.
+        weight = meta.materialize_meta_tensor(torch.empty(4, dtype=torch.int32, device="meta"))
+        weight[:3] = torch.tensor([4, 5, 6], dtype=torch.int32)
+        delattr(layer, "weight")
+        layer.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
+        layerwise._copy_and_restore_kernel_tensors(layer, info)
+
+    assert layer.weight is live
+    assert live.tolist() == [1 ^ 4, 2 ^ 5, 3 ^ 6, 0]
+    assert meta.materialize_meta_tensor is materialize
 
 
 def test_xor_into_rejects_mismatched_storage():

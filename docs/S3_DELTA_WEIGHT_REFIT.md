@@ -776,8 +776,9 @@ flowchart LR
   all-gather over the ranks assembles it, so each staged byte leaves host memory
   once per node rather than once per rank. Every other changed tensor goes
   through the layerwise reload with the final copy replaced by an XOR. That
-  reload's inputs are built on the GPU when it has room, rather than as host
-  arrays.
+  reload materializes each layer as zeros, so elements no loader writes, such
+  as padding rows, keep their live values. Its inputs are built on the GPU when
+  it has room, rather than as host arrays.
 - Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, the default
   on Blackwell in the vLLM versions tested, take sparse writes instead. That
   backend stores each expert's weights as a byte permutation of its checkpoint
