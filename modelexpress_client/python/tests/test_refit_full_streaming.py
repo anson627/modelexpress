@@ -186,7 +186,7 @@ def test_failed_install_discards_partial_cache(monkeypatch, tmp_path):
                 raise RuntimeError("install failed")
         adapter.close()
         assert not full.path.exists()
-        assert not full.path.with_name(full.path.name + ".tmp").exists()
+        assert not list(full.path.parent.glob(".checkpoint-*"))
     finally:
         adapter.close()
 

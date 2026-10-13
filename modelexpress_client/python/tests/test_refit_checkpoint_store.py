@@ -105,7 +105,7 @@ def test_materialization_is_independent_and_preserves_copy_metadata(
     assert weights.read_bytes() == b"canonical"
     assert (target / "weights").read_bytes() == b"delta"
     assert bool(calls) == clone
-    assert not target.with_suffix(".tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
 
 
 @pytest.mark.parametrize(
@@ -156,7 +156,7 @@ def test_clone_failure_cleans_partial_tree_without_publishing(
         store.replace_directory(target, copy_from=base),
     ):
         pytest.fail("must not publish a failed copy")
-    assert not target.with_suffix(".tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
     assert target.exists() == existing_target
     if existing_target:
         assert list(target.iterdir()) == [target / "old"]
@@ -197,7 +197,7 @@ def test_materialization_failure_retains_original_target(monkeypatch, tmp_path, 
         (temporary / "weights").write_bytes(b"partial delta")
         fail()
 
-    assert not target.with_suffix(".tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
     assert list(target.iterdir()) == [target / "old"]
     assert (target / "old").read_bytes() == b"old"
     assert (base / "weights").read_bytes() == b"canonical"
@@ -306,7 +306,7 @@ def test_store_directory_replacement_rolls_back_on_failure(tmp_path):
             raise RuntimeError("injected failure")
 
     assert (target / "original").read_text() == "original"
-    assert not target.with_name("v1.tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
 
 
 @pytest.mark.parametrize(
@@ -315,7 +315,8 @@ def test_store_directory_replacement_rolls_back_on_failure(tmp_path):
 def test_store_initialization_removes_interrupted_replacements(tmp_path, path_for):
     store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
     store.initialize()
-    kept = getattr(store, path_for)("v1")
+    # A version ID may end like a temporary name would.
+    kept = getattr(store, path_for)("v2.tmp")
     kept.mkdir()
     (kept / "weights").write_bytes(b"kept")
     # A process that stops while it fills a replacement never promotes it.

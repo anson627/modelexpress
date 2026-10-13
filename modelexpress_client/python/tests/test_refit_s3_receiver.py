@@ -2673,7 +2673,8 @@ def test_canonical_s3_downloads_full_shards_concurrently(
     assert len(write_threads) == 2
     assert torch.equal(load_file(staged.path / filenames[0])["a"], target["a"])
     assert torch.equal(load_file(staged.path / filenames[1])["b"], target["b"])
-    assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
+    store = adapter._checkpoint.store
+    assert not list(store.full_cache.glob(".checkpoint-*"))
     adapter.release_staged_weight(staged)
     adapter.close()
 
@@ -2952,7 +2953,8 @@ def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
         load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
         torch.tensor([1.0, 2.0]),
     )
-    assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
+    store = adapter._checkpoint.store
+    assert not list(store.full_cache.glob(".checkpoint-*"))
 
     with pytest.raises(RuntimeError, match="update is incomplete"):
         adapter.stage_weight(_full_inputs())
@@ -3051,7 +3053,8 @@ def test_canonical_s3_final_state_failure_leaves_checkpoint_updating(
         )["weight"],
         torch.tensor([7.0, 8.0]),
     )
-    assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
+    store = adapter._checkpoint.store
+    assert not list(store.full_cache.glob(".checkpoint-*"))
     adapter.close()
 
 
