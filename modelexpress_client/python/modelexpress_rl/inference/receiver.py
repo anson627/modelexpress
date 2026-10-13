@@ -1046,8 +1046,13 @@ class _LocalCheckpoint:
                 is_delta=True,
                 version=version,
             )
+            self.store.verify_artifact(artifact)
+            shards = {
+                filename: ((artifact / filename).read_bytes(), names)
+                for filename, names in _group_tensors_by_shard(weight_map).items()
+            }
             self._set_local_checkpoint(speculative_checkpoint)
-            self._apply_delta_artifact(artifact, metadata, weight_map, verify=False)
+            self._apply_shards(shards, index_metadata=metadata, verify=False)
             base_checkpoint = self.store.materialized_path(version.base_version_id)
             shutil.rmtree(base_checkpoint, ignore_errors=True)
             speculative_checkpoint.replace(base_checkpoint)
@@ -1074,13 +1079,6 @@ class _LocalCheckpoint:
         staged: bool,
     ) -> PreparedCheckpoint:
         target = versions[-1]
-        with self.store.installation_locked(shared=True), self.store.locked(
-            shared=True
-        ):
-            state, _active_version = self._load_prepared_state()
-            prepared = self._reuse_prepared_target(state=state, target=target, staged=staged)
-            if prepared is not None:
-                return prepared
         with self.store.installation_locked(), self.store.locked():
             self._resolve_speculation(versions)
             state, active_version = self._load_prepared_state()
@@ -1147,26 +1145,35 @@ class _LocalCheckpoint:
             return None
         if state.status is CheckpointState.STAGED and not staged:
             return None
-        delta_changes = self._delta_changes(target.version_id)
         # Followers reach this after the lock holder has reconstructed the
         # target. Source identity prevents attaching to a reused UID artifact.
         self.store.verify_artifact_source(
             self._artifact_path(target),
             _source_identity(target),
         )
-        staging, staging_base = self._staged_from(target.version_id)
-        return PreparedCheckpoint(
-            target_version=target.version_id,
-            path=self.local_checkpoint,
-            metrics={
+        return self._prepared(
+            state,
+            {
                 "perf/mx_receive_delta_index_download": 0.0,
                 "perf/mx_receive_delta_download": 0.0,
                 "perf/mx_receive_delta_apply": 0.0,
             },
-            delta_changes=delta_changes,
+        )
+
+    def _prepared(self, state: CheckpointRecord, metrics: dict[str, float]) -> PreparedCheckpoint:
+        """Describe the cache head ``state`` on the indexed files as a preparation."""
+        staging, staging_base = self._staged_from(state.version)
+        overlay = self._overlay(state)
+        if overlay:
+            metrics = {**metrics, "perf/mx_receive_staged_layers": float(len(overlay))}
+        return PreparedCheckpoint(
+            target_version=state.version,
+            path=self.local_checkpoint,
+            metrics=metrics,
+            delta_changes=self._delta_changes(state.version),
             staging=staging,
             staging_base=staging_base,
-            overlay=self._overlay(state),
+            overlay=overlay,
             overlay_base=state.base,
         )
 
@@ -1363,24 +1370,19 @@ class _LocalCheckpoint:
                 f"{failed_version.version_id!r}: {error}"
             ) from error
 
-        self.store.write_state(
+        state = self.store.write_state(
             status=CheckpointState.READY,
             version=target.version_id,
             checkpoint_paths=self.checkpoint_paths,
             source=_source_identity(target),
         )
-        staging, staging_base = self._staged_from(target.version_id)
-        return PreparedCheckpoint(
-            target_version=target.version_id,
-            path=self.local_checkpoint,
-            metrics={
+        return self._prepared(
+            state,
+            {
                 "perf/mx_receive_delta_index_download": index_download_time,
                 "perf/mx_receive_delta_download": download_time,
                 "perf/mx_receive_delta_apply": apply_time,
             },
-            delta_changes=self._delta_changes(target.version_id),
-            staging=staging,
-            staging_base=staging_base,
         )
 
     def _artifact_path(self, version: _S3Version) -> Path:
@@ -1715,27 +1717,14 @@ class _LocalCheckpoint:
         metrics: dict[str, float],
     ) -> PreparedCheckpoint:
         """Record a verified, staged delta as the STAGED head on files holding ``base``."""
-        self.store.write_state(
+        state = self.store.write_state(
             status=CheckpointState.STAGED,
             version=version.version_id,
             checkpoint_paths=self.checkpoint_paths,
             source=_source_identity(version),
             base=base,
         )
-        state = self.store.state()
-        assert state is not None
-        overlay = self._overlay(state)
-        staging, staging_base = self._staged_from(version.version_id)
-        return PreparedCheckpoint(
-            target_version=version.version_id,
-            path=self.local_checkpoint,
-            metrics={**metrics, "perf/mx_receive_staged_layers": float(len(overlay))},
-            delta_changes=self._delta_changes(version.version_id),
-            staging=staging,
-            staging_base=staging_base,
-            overlay=overlay,
-            overlay_base=base,
-        )
+        return self._prepared(state, metrics)
 
     def _materialize_staged(
         self,
@@ -1752,15 +1741,12 @@ class _LocalCheckpoint:
         delta's verification run as one pass, and that delta becomes the STAGED
         head on the rewritten files. Returns the new head's preparation.
         """
-        head, head_metadata = self._staged_head(state)
         # Staging holds each delta's nonzero bytes, so the rewrite scatters
         # those instead of decompressing the deltas again.
         layers = self._open_layers(state)
         try:
             return self._rewrite_staged(
                 state,
-                head,
-                head_metadata,
                 _staged_tensors(layers),
                 then=then,
                 following=following,
@@ -1770,31 +1756,9 @@ class _LocalCheckpoint:
             for layer in layers:
                 layer.close()
 
-    def _staged_head(self, state: CheckpointRecord) -> tuple[_S3Version, dict[str, Any]]:
-        """Return a STAGED head's delta and its index metadata."""
-        assert state.status is CheckpointState.STAGED and state.base is not None
-        layers = _staged_layers(self.store, state)
-        head = _S3Version(
-            version_id=state.version,
-            base_version_id=layers[-2] if len(layers) > 1 else state.base,
-            payload_format=WeightPayloadFormat.XOR_DELTA,
-            uri=(state.source or {}).get("uri", ""),
-        )
-        artifact = self.store.delta_path(head.version_id)
-        self.store.verify_artifact(artifact)
-        indexes = list(artifact.glob("*.index.json"))
-        if len(indexes) != 1:
-            raise RuntimeError(f"staged delta {head.version_id!r} has no single index")
-        metadata, _weight_map = _parse_index_manifest(
-            indexes[0].read_bytes(), is_delta=True, version=head
-        )
-        return head, metadata
-
     def _rewrite_staged(
         self,
         state: CheckpointRecord,
-        head: _S3Version,
-        head_metadata: dict[str, Any],
         pending: dict[str, tuple[StagedTensor, ...]],
         *,
         then: _S3Manifest | None,
@@ -1802,7 +1766,7 @@ class _LocalCheckpoint:
         index_download_time: float,
     ) -> PreparedCheckpoint:
         assert state.base is not None
-        protected_versions = _protected_versions(self.store, state.base, head.version_id)
+        protected_versions = _protected_versions(self.store, state.base, state.version)
         shards = None
         download_time = 0.0
         if then is not None:
@@ -1811,7 +1775,7 @@ class _LocalCheckpoint:
                 then[0], then[1], then[3], protected_versions=protected_versions
             )
         base_checkpoint = self.store.checkpoint_path(state.base)
-        target = self.store.materialized_path(head.version_id)
+        target = self.store.materialized_path(state.version)
         reuse_materialized = base_checkpoint.parent == self.store.materialized_cache
         self.store.ensure_capacity(
             0 if reuse_materialized else self.store.path_size_bytes(base_checkpoint),
@@ -1819,7 +1783,7 @@ class _LocalCheckpoint:
         )
         started = time.perf_counter()
         rewrite_seconds = 0.0
-        table = self.store.checksums(head.version_id)
+        table = self.store.checksums(state.version)
         stats: dict[str, float] = {}
         staged_next: (
             tuple[
@@ -1845,7 +1809,6 @@ class _LocalCheckpoint:
 
                 done = self._run_pass(
                     [_TensorPass(name, scatter=staged) for name, staged in pending.items()],
-                    index_metadata=head_metadata,
                     stop=stop if following is not None else None,
                 )
                 rewrite_seconds = time.perf_counter() - started
@@ -1854,7 +1817,7 @@ class _LocalCheckpoint:
                 try:
                     manifest, (shards, download_time), _index_seconds = self._fetch_following(
                         found[0],
-                        head=head.version_id,
+                        head=state.version,
                         protected_versions=protected_versions,
                         protected_paths=protected_paths,
                     )
@@ -1862,7 +1825,7 @@ class _LocalCheckpoint:
                     # The head's own rewrite can still finish without the delta.
                     logger.warning(
                         "Rewrite of %s continues without %s: %s",
-                        head.version_id,
+                        state.version,
                         found[0].version_id,
                         error,
                     )
@@ -1871,8 +1834,7 @@ class _LocalCheckpoint:
                             _TensorPass(name, scatter=staged)
                             for name, staged in pending.items()
                             if name not in done
-                        ],
-                        index_metadata=head_metadata,
+                        ]
                     )
                     return
             metadata = manifest[2]
@@ -1902,7 +1864,7 @@ class _LocalCheckpoint:
             # lineage. A copy leaves them, and the head STAGED on them, unchanged.
             self.store.write_state(
                 status=CheckpointState.UPDATING,
-                version=head.version_id,
+                version=state.version,
                 checkpoint_paths=self.checkpoint_paths,
             )
             shutil.rmtree(target, ignore_errors=True)
@@ -1919,21 +1881,13 @@ class _LocalCheckpoint:
         self._set_local_checkpoint(target)
         apply_seconds = time.perf_counter() - started
         if staged_next is None:
-            self.store.write_state(
+            rewritten = self.store.write_state(
                 status=CheckpointState.READY,
-                version=head.version_id,
+                version=state.version,
                 checkpoint_paths=self.checkpoint_paths,
                 source=state.source,
             )
-            staging, staging_base = self._staged_from(head.version_id)
-            return PreparedCheckpoint(
-                target_version=head.version_id,
-                path=target,
-                metrics={"perf/mx_receive_delta_rewrite": apply_seconds},
-                delta_changes=self._delta_changes(head.version_id),
-                staging=staging,
-                staging_base=staging_base,
-            )
+            return self._prepared(rewritten, {"perf/mx_receive_delta_rewrite": apply_seconds})
         (version, _index_data, _metadata, _weight_map), sink, checked = staged_next
         try:
             self.store.write_chain(version.version_id, self._delta_chain(version))
@@ -1943,14 +1897,14 @@ class _LocalCheckpoint:
             # The head's own rewrite finished, so keep it as READY.
             self.store.write_state(
                 status=CheckpointState.READY,
-                version=head.version_id,
+                version=state.version,
                 checkpoint_paths=self.checkpoint_paths,
                 source=state.source,
             )
             raise
         return self._staged_result(
             version,
-            base=head.version_id,
+            base=state.version,
             metrics={
                 "perf/mx_receive_delta_index_download": index_download_time,
                 "perf/mx_receive_delta_download": download_time,
@@ -2008,27 +1962,6 @@ class _LocalCheckpoint:
         staging = self.store.staging_path(version_id)
         base = StagedDelta.base_of(staging)
         return (staging, base) if base is not None else (None, None)
-
-    def _apply_delta_artifact(
-        self,
-        artifact: Path,
-        index_metadata: dict[str, Any],
-        weight_map: dict[str, str],
-        *,
-        verify: bool = True,
-        sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
-    ) -> None:
-        self.store.verify_artifact(artifact)
-        shards = {
-            filename: (
-                (artifact / filename).read_bytes(),
-                names,
-            )
-            for filename, names in _group_tensors_by_shard(weight_map).items()
-        }
-        self._apply_shards(
-            shards, index_metadata=index_metadata, verify=verify, sink=sink
-        )
 
     def _download_deltas(
         self,
@@ -2139,14 +2072,16 @@ class _LocalCheckpoint:
         self,
         tensors: list[_TensorPass],
         *,
-        index_metadata: dict[str, Any],
+        index_metadata: dict[str, Any] | None = None,
         sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
         stop: Callable[[], bool] | None = None,
         stats: dict[str, float] | None = None,
     ) -> set[str]:
         """Run each tensor's XORs over the checkpoint files; return the names done.
 
-        ``stop`` is asked before each tensor starts; once it returns True, the
+        ``index_metadata`` is the index of the delta that tensors write or check,
+        unneeded when they only scatter staged bytes. ``stop`` is asked before
+        each tensor starts; once it returns True, the
         tensors already started finish and the rest are left as they are.
         ``stats`` receives how many checks read only changed bytes and how many
         of those missed and read every byte.
@@ -2184,8 +2119,9 @@ class _LocalCheckpoint:
             for tensor in row
             if tensor is not None
         ]
-        checksum_format = index_metadata["checksum_format"]
-        decompress = _DECOMPRESSORS[index_metadata["compression_format"]]
+        formats = index_metadata or {}
+        checksum_format = formats.get("checksum_format")
+        decompress = _DECOMPRESSORS.get(formats.get("compression_format"))
         workers = min(rl_envs.MX_REFIT_DELTA_WORKERS, len(order))
         writes = any(tensor.write is not None or tensor.scatter for tensor in order)
         local = threading.local()
