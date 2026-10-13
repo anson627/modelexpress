@@ -97,6 +97,19 @@ class StagedTensor:
     values: np.ndarray
 
 
+def staged_window(staged: StagedTensor, begin: int, end: int) -> tuple[int, int]:
+    """Indices of a staged delta's bytes at tensor offsets ``[begin, end)``.
+
+    Staged offsets ascend within a tensor.
+    """
+    # Bounds of the offsets' own type keep the search from converting them all.
+    kind = staged.positions.dtype.type
+    first = int(np.searchsorted(staged.positions, kind(begin)))
+    if end >= staged.nbytes:
+        return first, staged.positions.size
+    return first, int(np.searchsorted(staged.positions, kind(end)))
+
+
 class StagedDelta:
     """Read-only view of a staged delta.
 

@@ -783,7 +783,12 @@ flowchart LR
   module's inputs until the module is complete, and those of a module it cannot
   complete, such as one with padding rows, until the reload ends. Kimi K3 pads
   its KDA input projections, and on a dense delta their held inputs need more
-  than 31 GiB per rank.
+  than 31 GiB per rank. Each rank's loaders read only its shard of most inputs,
+  so the zero pass of the first install from a checkpoint layout records the
+  bytes they read. Inputs built in host memory, where every page written
+  faults, carry only those bytes of the delta, and so do GPU inputs whose bytes
+  read are one range; selecting other shards costs the host more than the GPU
+  spends writing every staged byte.
 - Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, the default
   on Blackwell in the vLLM versions tested, take sparse writes instead. That
   backend stores each expert's weights as a byte permutation of its checkpoint
