@@ -306,6 +306,56 @@ def test_prefetcher_prepares_the_newest_registered_version(tmp_path):
     assert prefetcher.poll_once() is None
 
 
+def test_prefetcher_prepares_one_version_at_a_time(tmp_path):
+    objects = {
+        **_delta_snapshot(
+            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+        ),
+        **_delta_snapshot(
+            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
+        ),
+    }
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects)
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+    refit.add("v2", payload=XOR, base="v1", uri=_uri("run-v000002"), created=3)
+
+    # The engine may still be asked for v1, which a head at v2 could not serve.
+    assert prefetcher.poll_once() == "v1"
+    worker = _checkpoint(tmp_path, s3, initialize=False)
+    prepared = worker.prepare_chain((_delta("v1", base="base", identity="run-v000001"),))
+    assert torch.equal(_weight(prepared), torch.tensor([1.0, 3.0]))
+
+    checkpoint.store.activate("v1")
+    assert prefetcher.poll_once() == "v2"
+
+
+def test_a_failed_preparation_is_left_to_the_engine(tmp_path):
+    # This delta was computed against other base bytes, so its target check fails.
+    objects = _delta_snapshot(
+        [5.0, 5.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects)
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+
+    assert prefetcher.poll_once() is None
+    downloads = len(s3.gets)
+    assert prefetcher.poll_once() is None
+
+    assert len(s3.gets) == downloads
+    status = json.loads((checkpoint.store.cache / prefetch_module.STATUS_FILE).read_text())
+    assert (status["phase"], status["version"]) == ("failed", "v1")
+
+
+def test_a_streaming_engine_prepares_full_checkpoints_itself(tmp_path):
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, {})
+    prefetcher._settings = dataclasses.replace(prefetcher._settings, streamed=True)
+    refit.add("v1", payload=FULL, uri=_uri("run-v000001"), created=2)
+
+    assert prefetcher.poll_once() is None
+    assert s3.gets == []
+    assert checkpoint.store.state().version == "base"
+
+
 def test_speculative_prefetch_is_adopted_when_the_version_registers(tmp_path):
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
@@ -343,6 +393,20 @@ def test_prefetcher_adopts_its_speculation_on_registration(tmp_path):
     assert prefetcher.poll_once() == "v1"
     assert checkpoint.store.state().version == "v1"
     assert len(s3.gets) == downloads
+
+
+def test_a_speculative_head_resolves_its_registration_from_its_base(tmp_path):
+    objects = _delta_snapshot(
+        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
+    prefetcher._settings = dataclasses.replace(prefetcher._settings, max_replay_chain_length=1)
+    prefetcher.poll_once()
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+
+    # The speculation is never registered, so its lineage ends at its base.
+    assert prefetcher.poll_once() == "v1"
+    assert checkpoint.store.state().version == "v1"
 
 
 def test_speculation_runs_when_the_server_cannot_list_versions(tmp_path):
@@ -768,6 +832,7 @@ def test_generator_client_starts_and_stops_the_prefetcher(monkeypatch, tmp_path)
     canonical = CanonicalDeltaUpdateMethod.__new__(CanonicalDeltaUpdateMethod)
     canonical._model_name = "cache/model"
     canonical._staged_checkpoints = True
+    canonical._stream_full_checkpoints = True
     client = ModelExpressGeneratorClient()
     client.model_name = "registry/model"
     client.server_url = "mx:8001"
@@ -783,6 +848,7 @@ def test_generator_client_starts_and_stops_the_prefetcher(monkeypatch, tmp_path)
     assert settings.cache_model_name == "cache/model"
     assert settings.s3_watch is True
     assert settings.staged is True
+    assert settings.streamed is True
     assert settings.parent_pid == os.getpid()
     # The object-storage method initializes the cache before the client starts.
     settings.cache_dir().mkdir(parents=True)

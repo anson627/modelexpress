@@ -82,6 +82,11 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         return self._staged_checkpoints
 
     @property
+    def stream_full_checkpoints(self) -> bool:
+        """Whether full checkpoints stream into the engine as it installs them."""
+        return self._stream_full_checkpoints
+
+    @property
     def requires_full_root(self) -> bool:
         return not self._initialized
 

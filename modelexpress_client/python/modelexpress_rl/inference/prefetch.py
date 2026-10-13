@@ -86,6 +86,8 @@ class PrefetchSettings:
     parent_pid: int
     # Leave verified deltas staged on their base's files, rewritten later.
     staged: bool = False
+    # The engine streams full checkpoints as it installs them.
+    streamed: bool = False
 
     def object_storage(self) -> ObjectStorageGeneratorConfig:
         return ObjectStorageGeneratorConfig(
@@ -145,6 +147,9 @@ class RefitPrefetcher:
         # The STAGED head and files a rewrite last tried, which stay unwritten
         # below the layer limit, or when it found no room or failed.
         self._rewrite_tried: tuple[str, str | None] | None = None
+        # Versions whose preparation failed, with the head it started from. The
+        # engine prepares those itself when it needs them.
+        self._failed: set[tuple[str, str]] = set()
 
     @classmethod
     def connect(cls, settings: PrefetchSettings) -> RefitPrefetcher:
@@ -180,17 +185,17 @@ class RefitPrefetcher:
             return None
         if not self._may_move_head(state.version):
             return None
-        target = self._newest_registered() if self._registry_listing else None
-        if target is not None and self._should_prepare(target, head=state.version):
-            chain = self._registered_chain(target, head=state.version)
-            if chain is not None:
-                return self._prepare(
-                    target.version_id,
-                    kind="registered",
-                    run=lambda: self._checkpoint.prepare_chain(
-                        chain, staged=self._settings.staged, announce=False
-                    ),
-                )
+        head = self._registered_head(state.version)
+        version = self._next_registered(head)
+        if version is not None:
+            return self._prepare(
+                version.version_id,
+                head=head,
+                kind="registered",
+                run=lambda: self._checkpoint.prepare_chain(
+                    (version,), staged=self._settings.staged, announce=False
+                ),
+            )
         if self._settings.s3_watch:
             prepared = self._speculate(head=state.version, head_source=state.source)
             if prepared is not None:
@@ -205,6 +210,7 @@ class RefitPrefetcher:
             self._rewrite_tried = (state.version, state.base)
             return self._prepare(
                 state.version,
+                head=state.version,
                 kind="rewrite",
                 run=lambda: self._checkpoint.materialize_head(
                     staged=self._settings.staged,
@@ -232,11 +238,9 @@ class RefitPrefetcher:
                 return None
             checked["remote"] = now
             try:
-                target = self._newest_registered() if self._registry_listing else None
-                if target is not None and self._should_prepare(target, head=head.version):
-                    chain = self._registered_chain(target, head=head.version)
-                    if chain is not None and len(chain) == 1:
-                        return chain[0], False
+                version = self._next_registered(head.version)
+                if version is not None:
+                    return version, False
                 if self._settings.s3_watch:
                     found = self._next_speculative(head=head.version, head_source=head.source)
                     if found is not None:
@@ -313,16 +317,32 @@ class RefitPrefetcher:
             and speculation.get("base_version") == active
         )
 
-    def _should_prepare(self, target: WeightVersion, *, head: str) -> bool:
-        if target.version_id == head:
-            return False
+    def _registered_head(self, head: str) -> str:
+        """Return the head, or the registered base of a speculative head."""
         speculation = self._store.speculation()
-        # A speculative head is ahead of its base; preparing the base would undo it.
-        return not (
-            speculation is not None
-            and speculation.get("version") == head
-            and speculation.get("base_version") == target.version_id
-        )
+        if speculation is not None and speculation.get("version") == head:
+            return speculation.get("base_version", head)
+        return head
+
+    def _next_registered(self, head: str) -> _S3Version | None:
+        """Return the registered version after ``head`` toward the newest one.
+
+        Only the next version is prepared, so the cache head never passes a
+        version the engine may still be asked to install.
+        """
+        target = self._newest_registered() if self._registry_listing else None
+        if target is None or target.version_id == head:
+            return None
+        chain = self._registered_chain(target, head=head)
+        if not chain or (chain[0].version_id, head) in self._failed:
+            return None
+        if (
+            self._settings.streamed
+            and chain[0].payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+        ):
+            # Preparing it here would hold the cache the stream's writer waits on.
+            return None
+        return chain[0]
 
     def _newest_registered(self) -> WeightVersion | None:
         try:
@@ -403,10 +423,11 @@ class RefitPrefetcher:
     ) -> str | None:
         """Prepare the unregistered delta whose snapshot names the head as base."""
         version = self._next_speculative(head=head, head_source=head_source)
-        if version is None:
+        if version is None or (version.version_id, head) in self._failed:
             return None
         return self._prepare(
             version.version_id,
+            head=head,
             kind="speculative",
             run=lambda: self._checkpoint.prepare_speculative(
                 version, staged=self._settings.staged
@@ -491,6 +512,7 @@ class RefitPrefetcher:
         self,
         version_id: str,
         *,
+        head: str,
         kind: str,
         run: Any,
         uri: str | None = None,
@@ -501,7 +523,10 @@ class RefitPrefetcher:
         try:
             prepared: PreparedCheckpoint | None = run()
         except Exception as error:
-            logger.warning("prefetch of %s failed: %s", version_id, error)
+            logger.warning(
+                "prefetch of %s failed; the engine will prepare it: %s", version_id, error
+            )
+            self._failed.add((version_id, head))
             self._write_status(
                 phase="failed", version=version_id, kind=kind, uri=uri, error=str(error)
             )
