@@ -66,6 +66,15 @@ RUN set -eux; \
         auditwheel repair --plat "manylinux_2_28_${arch}" -w /dist "$whl"; \
     done
 
+# Extensions are optional at install time, but a platform wheel must carry them.
+RUN set -eux; \
+    for whl in /dist/*manylinux*.whl; do \
+        for ext in modelexpress/vmm/_alloc_ext modelexpress_rl/inference/_delta_ext; do \
+            python -m zipfile -l "$whl" | grep -qE "${ext}\.cpython-[^ ]+\.so" \
+                || { echo "$whl lacks $ext" >&2; exit 1; }; \
+        done; \
+    done
+
 RUN set -eux; \
     MX_SKIP_EXT=1 uv build --wheel --sdist \
         --python /opt/python/cp313-cp313/bin/python --out-dir /dist .; \
