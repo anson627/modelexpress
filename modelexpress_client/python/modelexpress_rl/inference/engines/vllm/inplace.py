@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import re
 import time
 import warnings
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from modelexpress_rl.inference.engines.vllm import sparse_experts
+from modelexpress_rl.inference.engines.vllm.surgical import checkpoint_module, module_groups
 from modelexpress_rl.inference.staging import (
     POSITIONS_FILE,
     VALUES_FILE,
@@ -54,7 +57,15 @@ _PROJECTIONS = {
     "w2": "down",
 }
 _LAYER = re.compile(r"\.layers\.(\d+)\.")
-_ARRANGED_KINDS = ("weight_packed", "weight_scale", "weight")
+_INDEXER = re.compile(r"^(.*\.indexer)\.(?:wk|weights_proj)\.")
+_SPARSE_PROJECTIONS = ("gate", "up", "down")
+_ARRANGED_KINDS = ("weight_packed", "weight_scale", "weight", "weight_scale_inv")
+# FP8 MoE backends whose processing only rearranges bits, and those that also
+# clamp scales, which then must not change.
+_BIT_MOVING_FP8_MOE = frozenset({"TRITON", "VLLM_CUTLASS"})
+_SCALE_CLAMPING_FP8_MOE = frozenset({"FLASHINFER_TRTLLM", "FLASHINFER_CUTLASS"})
+# FP8 linear kernels whose processing leaves weights and scales as loaded.
+_BIT_MOVING_FP8_LINEAR = frozenset({"CutlassFp8BlockScaledMMKernel", "TritonFp8BlockScaledMMKernel"})
 _TORCH_DTYPES = {
     "BF16": torch.bfloat16,
     "F16": torch.float16,
@@ -602,6 +613,84 @@ def process_like_weights(
         info.reset()
 
 
+def fp8_moe_unsupported(layer: torch.nn.Module, kinds: set[str]) -> str | None:
+    """Why processing an FP8 MoE layer's XOR delta would not reproduce its reload."""
+    method = getattr(layer, "quant_method", None)
+    backend = getattr(getattr(method, "fp8_backend", None), "name", None)
+    if backend is None:
+        return None
+    if getattr(method, "weight_scale_refine", None):
+        return "refined FP8 expert scales"
+    if backend in _BIT_MOVING_FP8_MOE:
+        return None
+    if backend in _SCALE_CLAMPING_FP8_MOE and sparse_experts.SCALE not in kinds:
+        return None
+    return f"FP8 MoE backend {backend} changes values while processing"
+
+
+def moves_bits(module: torch.nn.Module) -> bool:
+    """Whether a module's post-load processing only rearranges its tensors' bits."""
+    method = getattr(module, "quant_method", None)
+    if method is None or "fp8" not in type(method).__name__.lower():
+        return True
+    return type(getattr(method, "fp8_linear", None)).__name__ in _BIT_MOVING_FP8_LINEAR
+
+
+def read_targets(
+    names: Sequence[str],
+    locations: dict[str, tuple[Path, int, int]],
+    layers: Sequence[StagedDelta],
+    *,
+    threads: int = 16,
+) -> dict[str, np.ndarray]:
+    """Each tensor's checkpoint bytes with every staged layer's delta XORed in, oldest first."""
+    descriptors = {path: os.open(path, os.O_RDONLY) for path in {locations[name][0] for name in names}}
+
+    def read(name: str) -> tuple[str, np.ndarray]:
+        path, offset, size = locations[name]
+        data = np.empty(size, dtype=np.uint8)
+        view, done = memoryview(data), 0
+        while done < size:
+            count = os.preadv(descriptors[path], [view[done:]], offset + done)
+            if count <= 0:
+                raise OSError(f"{path} ended before tensor {name}")
+            done += count
+        for layer in layers:
+            if name in layer:
+                delta = layer.tensor(name)
+                data[delta.positions.astype(np.intp, copy=False)] ^= delta.values
+        return name, data
+
+    try:
+        with ThreadPoolExecutor(threads, thread_name_prefix="mx-target-read") as pool:
+            return dict(pool.map(read, names))
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def _expert_shapes(
+    expert_names: dict[tuple[int, str, str], str], metadata: dict[str, dict]
+) -> dict[tuple[str, str], tuple[int, ...]] | None:
+    """Checkpoint shapes of expert 0's weights and FP32 scales, or None if any is missing."""
+    shapes = {}
+    for proj in _SPARSE_PROJECTIONS:
+        for kind in (sparse_experts.WEIGHT, sparse_experts.SCALE):
+            name = expert_names.get((0, proj, kind))
+            if name is None or (kind == sparse_experts.SCALE and metadata[name]["dtype"] != "F32"):
+                return None
+            shapes[(proj, kind)] = tuple(metadata[name]["shape"])
+    return shapes
+
+
+def _local_expert(layer: torch.nn.Module, expert: int) -> int:
+    local = getattr(layer, "_map_global_expert_id_to_local_expert_id", None)
+    index = int(local(expert)) if local is not None else expert
+    if index < 0:
+        raise InPlaceUnsupported(f"expert {expert} is not local")
+    return index
+
+
 @dataclass(frozen=True)
 class CheckpointCatalog:
     """A checkpoint's tensor names by decoder layer, built once per layout."""
@@ -663,25 +752,62 @@ class InPlaceInstaller:
         self._catalog: tuple[dict[str, dict], CheckpointCatalog] | None = None
         # Time spent building the reload's inputs in the current install.
         self._input_seconds = 0.0
+        self._sparse = sparse_experts.SparseExperts(device)
+        # Expert layers sparse writes cannot install, with the reason last logged.
+        self._sparse_rejected: dict[int, str] = {}
+        # Per checkpoint layout: whether each generic tensor's module needs its values.
+        self._needs_values: tuple[dict[str, dict], dict[str, bool]] | None = None
+        self._packed: dict[str, list[str]] | None = None
 
-    def install(self, checkpoint: str | Path, staging: Path) -> dict[str, float]:
+    def install(
+        self,
+        checkpoint: str | Path,
+        staging: Path,
+        *,
+        overlay: Sequence[Path] = (),
+        reload_values: Callable[[set[str]], dict[str, float]] | None = None,
+    ) -> dict[str, float]:
+        """Install the staged delta from the live version to the target.
+
+        ``overlay`` lists the staged deltas, oldest first and ending with the
+        target's, that turn the checkpoint files into the target when the files
+        hold an earlier version. ``reload_values`` reloads the modules of the
+        named tensors from the target's values, for modules whose processing
+        changes values; without it, those modules make the install unavailable.
+        """
         started = time.perf_counter()
         try:
             staged = StagedDelta(staging)
         except ValueError as error:
             raise InPlaceUnsupported(str(error)) from error
+        layers: list[StagedDelta] = []
         try:
+            for path in overlay:
+                same = Path(path).resolve() == Path(staging).resolve()
+                try:
+                    layers.append(staged if same else StagedDelta(Path(path)))
+                except ValueError as error:
+                    raise InPlaceUnsupported(str(error)) from error
             with _quiet_readonly_buffers():
-                metrics = self._install(checkpoint, staged)
+                metrics = self._install(checkpoint, staged, layers, reload_values)
         finally:
+            for layer in layers:
+                if layer is not staged:
+                    layer.close()
             staged.close()
         _synchronize(self._device)
         metrics["perf/mx_receive_inplace_time"] = time.perf_counter() - started
         return metrics
 
-    def _install(self, checkpoint: str | Path, staged: StagedDelta) -> dict[str, float]:
+    def _install(
+        self,
+        checkpoint: str | Path,
+        staged: StagedDelta,
+        layers: Sequence[StagedDelta] = (),
+        reload_values: Callable[[set[str]], dict[str, float]] | None = None,
+    ) -> dict[str, float]:
         index_started = time.perf_counter()
-        _paths, _locations, metadata = index_checkpoint_tensors(checkpoint)
+        _paths, locations, metadata = index_checkpoint_tensors(checkpoint)
         catalog = self._catalog_for(metadata)
         names = staged.names()
         if any(name not in metadata for name in names):
@@ -697,8 +823,36 @@ class InPlaceInstaller:
         if missing:
             raise InPlaceUnsupported(f"no routed-expert module for layers {missing[:5]}")
         index_seconds = time.perf_counter() - index_started
+        plan_started = time.perf_counter()
+        # Modules whose processing changes values reload from the target's values,
+        # so the XOR paths leave every tensor of theirs alone.
+        values = self._value_tensors(changed, catalog, metadata)
+        if values and reload_values is None:
+            raise InPlaceUnsupported(f"processing changes the values of {sorted(values)[:3]}")
+        self._sparse.layout_seconds = 0.0
+        layouts = self._sparse_layouts(expert_layers, staged, catalog, metadata)
+        for index in expert_layers:
+            if index not in layouts:
+                kinds = {
+                    kind
+                    for (_expert, _proj, kind), name in catalog.experts.get(index, {}).items()
+                    if name in staged
+                }
+                reason = fp8_moe_unsupported(self._experts[index], kinds)
+                if reason is not None:
+                    raise InPlaceUnsupported(f"layer {index}: {reason}")
+        plan_seconds = time.perf_counter() - plan_started
 
         expert_started = time.perf_counter()
+        scale_names = [
+            name
+            for index in layouts
+            for (_expert, _proj, kind), name in catalog.experts[index].items()
+            if kind == sparse_experts.SCALE and name in staged
+        ]
+        # Target scales are read from the checkpoint files while weights are written.
+        pool = ThreadPoolExecutor(1, thread_name_prefix="mx-scale-targets")
+        targets = pool.submit(read_targets, scale_names, locations, layers) if scale_names else None
         layer_runs = {}
         for index in expert_layers:
             span = expert_rows(staged, catalog.experts.get(index, {}))
@@ -710,33 +864,184 @@ class InPlaceInstaller:
             self._device,
             peers=self._peers,
         )
+        sparse_bytes = scale_tensors = 0
         try:
             for index in expert_layers:
-                self._install_experts(
-                    self._experts[index],
-                    staged,
-                    catalog.experts.get(index, {}),
-                    metadata,
-                    itertools.islice(reader, len(layer_runs[index])),
-                )
+                runs = itertools.islice(reader, len(layer_runs[index]))
+                if index in layouts:
+                    sparse_bytes += self._install_sparse(
+                        self._experts[index], staged, catalog.experts[index], layouts[index], runs
+                    )
+                else:
+                    self._install_experts(
+                        self._experts[index],
+                        staged,
+                        catalog.experts.get(index, {}),
+                        metadata,
+                        runs,
+                    )
+            if targets is not None:
+                found = targets.result()
+                for index, layout in layouts.items():
+                    scale_tensors += self._sparse.write_scales(
+                        self._experts[index],
+                        layout,
+                        self._target_scales(
+                            self._experts[index], catalog.experts[index], staged, metadata, found
+                        ),
+                    )
         finally:
             reader.close()
+            pool.shutdown(wait=True, cancel_futures=True)
         _synchronize(self._device)
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
         self._input_seconds = 0.0
-        fed = self._install_generic(staged, changed, catalog, metadata)
+        fed = self._install_generic(
+            staged,
+            [name for name in changed if name not in values],
+            catalog,
+            metadata,
+            excluded=values,
+        )
         _synchronize(self._device)
+        generic_seconds = time.perf_counter() - generic_started
+        value_started = time.perf_counter()
+        value_metrics = {}
+        if values:
+            assert reload_values is not None
+            value_metrics = reload_values({name for name in changed if name in values}) or {}
         return {
+            **value_metrics,
             "perf/mx_receive_inplace_index_time": index_seconds,
+            "perf/mx_receive_inplace_plan_time": plan_seconds,
             "perf/mx_receive_inplace_expert_layers": float(len(expert_layers)),
             "perf/mx_receive_inplace_expert_time": expert_seconds,
             "perf/mx_receive_inplace_expert_wait_time": reader.wait_seconds,
+            "perf/mx_receive_inplace_sparse_expert_layers": float(len(layouts)),
+            "perf/mx_receive_inplace_sparse_expert_bytes": float(sparse_bytes),
+            "perf/mx_receive_inplace_sparse_scale_tensors": float(scale_tensors),
+            "perf/mx_receive_inplace_sparse_layout_time": self._sparse.layout_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
             "perf/mx_receive_inplace_input_time": self._input_seconds,
-            "perf/mx_receive_inplace_generic_time": time.perf_counter() - generic_started,
+            "perf/mx_receive_inplace_generic_time": generic_seconds,
+            "perf/mx_receive_inplace_value_tensors": float(len(values)),
+            "perf/mx_receive_inplace_value_time": time.perf_counter() - value_started,
         }
+
+    def _sparse_layouts(
+        self,
+        expert_layers: list[int],
+        staged: StagedDelta,
+        catalog: CheckpointCatalog,
+        metadata: dict[str, dict],
+    ) -> dict[int, sparse_experts.ExpertLayout]:
+        """Layouts of the expert layers sparse writes install; the rest take the arranged path."""
+        layouts: dict[int, sparse_experts.ExpertLayout] = {}
+        rejected: dict[str, list[int]] = defaultdict(list)
+        for index in expert_layers:
+            layer = self._experts[index]
+            reason = sparse_experts.ineligible(layer)
+            shapes = None
+            if reason is None:
+                shapes = _expert_shapes(catalog.experts.get(index, {}), metadata)
+                if shapes is None:
+                    reason = "the checkpoint lacks an FP32-scaled weight of every projection"
+            if reason is None:
+                assert shapes is not None
+                started = time.perf_counter()
+                try:
+                    layouts[index] = self._sparse.layout(layer, shapes)
+                except sparse_experts.SparseExpertError as error:
+                    reason = str(error)
+                self._sparse.layout_seconds += time.perf_counter() - started
+            if reason is not None:
+                if self._sparse_rejected.get(index) != reason:
+                    rejected[reason].append(index)
+                self._sparse_rejected[index] = reason
+        for reason, indices in rejected.items():
+            logger.info("Sparse expert writes skip %d layers, e.g. %s: %s", len(indices), indices[:3], reason)
+        return layouts
+
+    def _install_sparse(
+        self,
+        layer: torch.nn.Module,
+        staged: StagedDelta,
+        expert_names: dict[tuple[int, str, str], str],
+        layout: sparse_experts.ExpertLayout,
+        runs: Iterator[StagedRun],
+    ) -> int:
+        span = expert_rows(staged, expert_names)
+        if span is None:
+            return 0
+        begin, end = span
+        rules = np.full((2, end - begin), -1, dtype=np.int64)
+        for (expert, proj, kind), name in expert_names.items():
+            if kind == sparse_experts.WEIGHT and name in staged:
+                row = staged.row(name) - begin
+                rules[0, row] = _SPARSE_PROJECTIONS.index(proj)
+                rules[1, row] = _local_expert(layer, expert)
+        return self._sparse.write_weights(
+            layer,
+            layout,
+            _to_device(rules, self._device),
+            _to_device(staged.counts(begin, end), self._device),
+            begin,
+            runs,
+        )
+
+    @staticmethod
+    def _target_scales(
+        layer: torch.nn.Module,
+        expert_names: dict[tuple[int, str, str], str],
+        staged: StagedDelta,
+        metadata: dict[str, dict],
+        targets: dict[str, np.ndarray],
+    ) -> Iterator[tuple[str, int, torch.Tensor]]:
+        for (expert, proj, kind), name in expert_names.items():
+            if kind == sparse_experts.SCALE and name in staged:
+                value = torch.from_numpy(targets[name].view(np.float32)).reshape(metadata[name]["shape"])
+                yield proj, _local_expert(layer, expert), value
+
+    def _value_tensors(
+        self, changed: list[str], catalog: CheckpointCatalog, metadata: dict[str, dict]
+    ) -> set[str]:
+        """Generic tensors of the modules whose processing changes the values of changed tensors."""
+        if self._needs_values is None or self._needs_values[0] is not metadata:
+            self._needs_values = (metadata, {})
+        known = self._needs_values[1]
+        packed = self._packed_modules()
+        needed = []
+        for name in changed:
+            if name in catalog.per_expert:
+                continue
+            if name not in known:
+                known[name] = self._needs_value(name, metadata, packed)
+            if known[name]:
+                needed.append(name)
+        return module_groups(needed, catalog.generic, packed) if needed else set()
+
+    def _needs_value(
+        self, name: str, metadata: dict[str, dict], packed: dict[str, list[str]]
+    ) -> bool:
+        indexer = _INDEXER.search(name)
+        if indexer and metadata.get(f"{indexer[1]}.wk.weight", {}).get("dtype", "").startswith("F8"):
+            # vLLM dequantizes an FP8 wk into the indexer's fused weight while loading.
+            return True
+        try:
+            module = self._model.get_submodule(checkpoint_module(name, packed))
+        except AttributeError:
+            # An FP8 tensor whose module is unknown may not install bit for bit.
+            return metadata[name]["dtype"].startswith("F8") or name.endswith("weight_scale_inv")
+        return not moves_bits(module)
+
+    def _packed_modules(self) -> dict[str, list[str]]:
+        if self._packed is None:
+            self._packed = {}
+            for module in self._model.modules():
+                self._packed.update(getattr(module, "packed_modules_mapping", None) or {})
+        return self._packed
 
     def _catalog_for(self, metadata: dict[str, dict]) -> CheckpointCatalog:
         # The checkpoint index returns the same metadata while headers are unchanged.
@@ -782,16 +1087,23 @@ class InPlaceInstaller:
         changed: list[str],
         catalog: CheckpointCatalog,
         metadata: dict[str, dict],
+        *,
+        excluded: set[str] = frozenset(),
     ) -> int:
-        """Reload every tensor of each changed non-expert group with XOR restore."""
+        """Reload every tensor of each changed non-expert group with XOR restore.
+
+        The reload feeds none of the ``excluded`` tensors. Returns how many it fed.
+        """
         groups = {catalog.layers[name] for name in changed if name not in catalog.per_expert}
-        if not groups:
-            return 0
         fed = [
             name
             for name in catalog.generic
-            if catalog.layers[name] in groups and self._served(catalog.layers[name])
+            if catalog.layers[name] in groups
+            and self._served(catalog.layers[name])
+            and name not in excluded
         ]
+        if not fed:
+            return 0
         unknown = sorted({metadata[name]["dtype"] for name in fed} - _TORCH_DTYPES.keys())
         if unknown:
             raise InPlaceUnsupported(f"unsupported checkpoint dtypes {unknown}")

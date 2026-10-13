@@ -736,24 +736,51 @@ flowchart LR
   through the layerwise reload with the final copy replaced by an XOR. That
   reload's inputs are built on the GPU when it has room, rather than as host
   arrays.
+- Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, vLLM's
+  default on Blackwell, take sparse writes instead. That backend stores each
+  expert's weights as a byte permutation of its checkpoint tensors, and its
+  scales permuted and clamped. The installer derives both maps once per expert
+  shape by sending position codes through vLLM's own per-rank expert loader and
+  kernel-format conversion, then XORs only the staged bytes each rank owns into
+  live memory. Changed scales are rebuilt from the checkpoint files, with the
+  staged deltas since applied, and written as absolute values with the kernel's
+  clamp to every copy the kernel reads. Experts under other FP8 MoE backends
+  take the batched path only when processing keeps them bit for bit: Triton
+  and vLLM CUTLASS always, FlashInfer's TRT-LLM and CUTLASS backends when no
+  scale changed. Otherwise the update reloads.
+- Some modules change values while processing, so XORing their delta would be
+  wrong: FP8 linear layers under DeepGEMM, vLLM's default on Blackwell, which
+  requantizes them to power-of-two scales, and FP8 indexer `wk` weights, which
+  vLLM dequantizes into the indexer's fused weight while loading. These modules
+  reload from the target's values instead, read from the checkpoint files with
+  the staged deltas since applied, and the XOR paths leave them alone. Under
+  `--linear-backend cutlass` or `triton`, FP8 linear layers keep their loaded
+  bits and take the XOR paths, which avoids reloading them.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
 - Checkpoint headers are parsed once per process. Deltas never change them, so
   each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
-  `perf/mx_receive_inplace_expert_time`, and
+  `perf/mx_receive_inplace_plan_time`, `perf/mx_receive_inplace_expert_time`, and
   `perf/mx_receive_inplace_generic_time` split the install.
   `perf/mx_receive_inplace_expert_wait_time` is the part of the expert time
   spent waiting for staged bytes to be read, and
   `perf/mx_receive_inplace_input_time` the part of the generic time spent
-  building the reload's inputs.
+  building the reload's inputs. `perf/mx_receive_inplace_sparse_expert_layers`,
+  `perf/mx_receive_inplace_sparse_expert_bytes` and
+  `perf/mx_receive_inplace_sparse_scale_tensors` count the sparse writes, and
+  `perf/mx_receive_inplace_sparse_layout_time` the time spent deriving their
+  maps. `perf/mx_receive_inplace_value_tensors` and
+  `perf/mx_receive_inplace_value_time` cover the modules reloaded from values.
 - After the engine starts, it holds `initial_serving_version_id` when the
   orchestrator passes one, and otherwise `initial_base_version_id`. The first
   delta from that version installs in place, or surgically, without a full
   reload.
 - The update falls back to a reload when the engine does not hold the delta's
   base, when a layer is not supported (expert parallelism, an unexpected expert
-  tensor, or a layout mismatch), or when the staging is missing or its files do
-  not match its index. Anything already XORed belongs to a changed module,
-  which the reload rewrites.
+  tensor, a layout mismatch, or FP8 expert processing that changes values), or
+  when the staging is missing or its files do not match its index. Anything
+  already XORed belongs to a changed module, which the reload rewrites. Sparse
+  writes also skip layers whose tensor-parallel shards vLLM pads to whole
+  blocks.
 - A model qualifies when its processing only rearranges bits. Check a new model,
   quantization, or kernel backend by comparing an in-place install with a
   reload of the same target before enabling it.

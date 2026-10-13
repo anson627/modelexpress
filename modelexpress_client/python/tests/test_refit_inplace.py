@@ -1108,14 +1108,16 @@ class _InPlace:
     def __init__(self, model, *, device, generic_reload, peers):
         pass
 
-    def install(self, path, staging):
+    def install(self, path, staging, *, overlay=(), reload_values=None):
         _InPlace.calls.append((path, staging))
         if _InPlace.error is not None:
             raise _InPlace.error
         return {
             "perf/mx_receive_inplace_time": 0.5,
             "perf/mx_receive_inplace_expert_layers": 2.0,
+            "perf/mx_receive_inplace_sparse_expert_layers": 1.0,
             "perf/mx_receive_inplace_generic_tensors": 3.0,
+            "perf/mx_receive_inplace_value_tensors": 0.0,
         }
 
 

@@ -1176,6 +1176,10 @@ installed before the checkpoint files are rewritten, and `MX_REFIT_STAGED_LAYERS
 written into the files while the engine serves, which for a full checkpoint
 needs room in `refit_checkpoint_max_size_gb` for one more copy of its files; see
 [Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
+For block-FP8 models on Blackwell, routed experts under vLLM's default
+FlashInfer TRT-LLM MoE backend take sparse writes, while FP8 linear layers under
+its default DeepGEMM kernel reload from target values during the update;
+serving with `--linear-backend cutlass` keeps them on the faster XOR path.
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish

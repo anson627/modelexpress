@@ -624,6 +624,9 @@ engine integrations.
 - `inference/staging.py` owns the staged nonzero XOR bytes of a prepared delta,
   and `inference/engines/vllm/inplace.py` installs them into live vLLM weights
   in place by processing the delta like weights and XORing the result.
+  `inference/engines/vllm/sparse_experts.py` writes block-FP8 routed experts
+  sparsely through maps derived from vLLM's own expert loader and kernel
+  conversion.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
@@ -1210,7 +1213,8 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
 | `inference/prefetch.py` | Optional background preparation of new versions outside the serving pause, plus speculative S3 deltas adopted on registration |
 | `inference/staging.py` | Staged nonzero XOR bytes of a prepared delta, memory-mapped by engine ranks |
-| `inference/engines/vllm/inplace.py` | In-place delta install: routed experts from staged bytes, other tensors through layerwise reload with XOR restore |
+| `inference/engines/vllm/inplace.py` | In-place delta install: routed experts from staged bytes, other tensors through layerwise reload with XOR restore, and modules whose processing changes values through a reload from target values |
+| `inference/engines/vllm/sparse_experts.py` | Sparse writes of staged block-FP8 expert bytes into live MoE kernel tensors, with checkpoint-to-live maps derived from vLLM's per-rank loader and kernel conversion |
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
