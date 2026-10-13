@@ -1307,6 +1307,8 @@ class _LocalCheckpoint:
         ):
             # The first delta applies to the head's own bytes, so write them first.
             self._materialize_staged(state)
+            state = self.store.state()
+            assert state is not None
         # READY -> UPDATING is persisted before any derived checkpoint mutates.
         # A crash therefore makes the next initializer rebuild from lineage.
         self.store.write_state(
@@ -1315,6 +1317,9 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
+        # Each step checks for room before it changes the files, so a full cache
+        # leaves them holding the head or the last version prepared.
+        restore = state
         failed_version = target
         try:
             download_time = 0.0
@@ -1337,12 +1342,19 @@ class _LocalCheckpoint:
                     )
                 download_time += downloaded
                 apply_time += applied
+                restore = CheckpointRecord(
+                    status=CheckpointState.READY,
+                    version=version.version_id,
+                    source=_source_identity(version),
+                )
         except CheckpointCacheCapacityError:
-            self._set_local_checkpoint(self.store.checkpoint_path(active_version))
+            self._set_local_checkpoint(self.store.checkpoint_path(restore.files_version))
             self.store.write_state(
-                status=CheckpointState.READY,
-                version=active_version,
+                status=restore.status,
+                version=restore.version,
                 checkpoint_paths=self.checkpoint_paths,
+                source=restore.source,
+                base=restore.base,
             )
             raise
         except Exception as error:
@@ -1588,7 +1600,11 @@ class _LocalCheckpoint:
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
         if sink is not None:
-            self._write_staging(version, sink)
+            try:
+                self._write_staging(version, sink)
+            except CheckpointCacheCapacityError as error:
+                # The files hold the target already, which installs by reloading.
+                logger.warning("No room to stage %s: %s", version.version_id, error)
         self._record_checksums(version, self.store.checksums(version.base_version_id), tensors)
         return download_time, time.perf_counter() - apply_started
 

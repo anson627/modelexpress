@@ -408,8 +408,11 @@ ModelExpress rechecks free space before known writes and copies as other disk
 usage changes. It evicts stale derived materializations before stale canonical
 artifacts, but never evicts the active lineage or the checkpoint being prepared
 or installed. Capacity must therefore cover the active checkpoint plus the
-rollback-safe working set for one update. A capacity rejection preserves the
-active checkpoint as READY so a later update can retry. On initialization, the
+rollback-safe working set for one update. Each step of a preparation checks
+for room before it changes the checkpoint files, so a capacity rejection leaves
+the cache head READY at the version they hold, and a later update can retry. A
+delta written into the files without room for its staged bytes still prepares,
+and installs by reloading instead of in place. On initialization, the
 configured seed is restored as the initial full artifact and becomes the active
 version.
 

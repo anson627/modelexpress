@@ -316,6 +316,22 @@ def test_evicting_a_version_removes_its_staging(monkeypatch, tmp_path):
     assert not store.staging_path("v1").exists()
 
 
+def test_a_delta_without_room_for_its_staging_still_prepares(monkeypatch, tmp_path):
+    s3 = _FakeS3(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
+    checkpoint = _checkpoint(tmp_path, s3)
+
+    def full(*_args, **_kwargs):
+        raise receiver_module.CheckpointCacheCapacityError("checkpoint cache is full")
+
+    monkeypatch.setattr(checkpoint, "_write_staging", full)
+    prepared = checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),))
+
+    # The files already hold the target, which installs by reloading instead.
+    assert prepared.staging is None
+    assert checkpoint.store.state().version == "v1"
+    assert load_file(prepared.path / "model.safetensors")["weight"].tolist() == [1.0, 3.0]
+
+
 # Each delta changes some tensors of a two-tensor checkpoint.
 _LINEAGE = {
     "base": {"a": [1.0, 2.0], "b": [3.0, 4.0]},
