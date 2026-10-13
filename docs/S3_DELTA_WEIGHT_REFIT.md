@@ -778,7 +778,11 @@ flowchart LR
   through the layerwise reload with the final copy replaced by an XOR. That
   reload materializes each layer as zeros, so elements no loader writes, such
   as padding rows, keep their live values. Its inputs are built on the GPU when
-  it has room, rather than as host arrays.
+  it has room for twice the largest of them and 1 GiB, rather than as host
+  arrays. vLLM holds every input of a module it cannot complete, such as one
+  with padding rows, until the reload ends, so a dense delta can need far more:
+  Kimi K3's held over 31 GiB per rank and ran out of GPU memory at
+  `--gpu-memory-utilization` 0.8.
 - Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, the default
   on Blackwell in the vLLM versions tested, take sparse writes instead. That
   backend stores each expert's weights as a byte permutation of its checkpoint
