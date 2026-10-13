@@ -595,6 +595,27 @@ def test_a_staged_head_at_the_layer_limit_is_rewritten_once_the_engine_serves_it
     assert _staged_target(following) == _LINEAGE["v3"]
 
 
+def test_a_rewrite_that_fails_in_a_copy_leaves_the_head_staged(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    store = checkpoint.store
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+
+    # Deltas staged on a full checkpoint are written into a copy of its files.
+    def fail(*_args, **_kwargs):
+        raise OSError("injected failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint, "_run_pass", fail)
+        with pytest.raises(OSError, match="injected failure"):
+            checkpoint.materialize_head(staged=False)
+    checkpoint.recover_incomplete_preparation()
+
+    state = store.state()
+    assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v1", "base")
+    following = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+    assert _staged_target(following) == _LINEAGE["v2"]
+
+
 
 
 def test_a_rewrite_joins_a_delta_that_appears_while_it_runs(monkeypatch, tmp_path):

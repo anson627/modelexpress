@@ -1817,12 +1817,6 @@ class _LocalCheckpoint:
             0 if reuse_materialized else self.store.path_size_bytes(base_checkpoint),
             protected_versions=protected_versions,
         )
-        # STAGED -> UPDATING before the files change, so a crash rebuilds from lineage.
-        self.store.write_state(
-            status=CheckpointState.UPDATING,
-            version=head.version_id,
-            checkpoint_paths=self.checkpoint_paths,
-        )
         started = time.perf_counter()
         rewrite_seconds = 0.0
         table = self.store.checksums(head.version_id)
@@ -1904,6 +1898,13 @@ class _LocalCheckpoint:
             staged_next = (manifest, sink, checked)
 
         if reuse_materialized:
+            # STAGED -> UPDATING before the files change, so a crash rebuilds from
+            # lineage. A copy leaves them, and the head STAGED on them, unchanged.
+            self.store.write_state(
+                status=CheckpointState.UPDATING,
+                version=head.version_id,
+                checkpoint_paths=self.checkpoint_paths,
+            )
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)

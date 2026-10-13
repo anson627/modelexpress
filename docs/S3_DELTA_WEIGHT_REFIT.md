@@ -852,9 +852,10 @@ stateDiagram-v2
 - Any other preparation, such as a chain of several deltas, or a caller that
   needs the target's own files, writes the staged deltas into the files first.
 - While files are rewritten in place, the head is `UPDATING`, so a crash makes
-  the next initialization rebuild it from its lineage. A crash during a rewrite
-  into a copy leaves the head `STAGED`, and the next initialization removes the
-  partial copy.
+  the next initialization rebuild it from its lineage. Deltas staged on a full
+  checkpoint are always written into a copy, since full checkpoints never
+  change. A crash or failure during a rewrite into a copy leaves the head
+  `STAGED`, and the next initialization removes the partial copy.
 - `perf/mx_receive_delta_apply` is the time of the checking pass,
   `perf/mx_receive_staged_layers` the number of deltas staged after it, and
   `perf/mx_receive_delta_rewrite` the time spent writing staged deltas into the
