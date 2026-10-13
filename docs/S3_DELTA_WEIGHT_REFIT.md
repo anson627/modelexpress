@@ -48,6 +48,7 @@ Environment variables used by the clients and vLLM engine:
 | `AWS_DEFAULT_REGION` | unset | S3 region when `region_name` is not supplied in client configuration. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional tensor-bucket size override for framework integrations. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
+| `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental: install a delta by reloading only the vLLM modules whose checkpoint tensors changed since the engine's last checkpoint install, instead of the whole checkpoint. |
 | `MX_REFIT_PREFETCH` | `false` | Prepare new versions in a background process before the update pauses the engine. See [Background prefetch](#background-prefetch). |
 | `MX_REFIT_PREFETCH_S3_WATCH` | `false` | Also prepare deltas found in S3 before their versions are registered. Requires `MX_REFIT_PREFETCH`. |
 | `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
@@ -57,6 +58,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_NATIVE_CHECK` | `true` | Check deltas in the C++ delta checker when the client was built with it. `false` checks them in Python. See [Install before rewrite](#install-before-rewrite). |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
+| `MX_REFIT_FULL_STREAMING` | `false` | Experimental: install a full HF checkpoint without declared checksums by streaming it from S3 through vLLM's reload, and cache it in the background. See [streamed full refit](ARCHITECTURE.md#experimental-streamed-full-refit). |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Generator download concurrency. |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size. |
@@ -269,10 +271,10 @@ verified. The first delta after a full checkpoint copies that immutable
 full checkpoint into `materialized/<version>/`, as a reflink clone where the
 filesystem supports it. Later sequential deltas rename the active derived
 checkpoint and apply only the incoming delta in place, so they do not copy the
-full model. A delta applies in 16 MiB chunks that are read from the checkpoint
-file, XORed, checksummed, and written back; a tensor larger than 256 MiB spreads
-its chunks over the `MX_REFIT_DELTA_WORKERS` threads. Current vLLM and SGLang
-installers consume that
+full model. A delta applies in 16 MiB chunks that are read from the
+checkpoint file, XORed, checksummed, and written back; a tensor larger
+than 256 MiB spreads its chunks over the `MX_REFIT_DELTA_WORKERS`
+threads. Current vLLM and SGLang installers consume that
 ordinary checkpoint directory. Materializations are derived and can be rebuilt
 from the canonical lineage. If a delta fails while it is written into the files,
 the running engine keeps its previous weights, and the cache remains `UPDATING`
@@ -282,12 +284,12 @@ checkpoint.
 `state.json` records whether preparation is `READY`, `STAGED`, or `UPDATING` and
 protects against interrupted writes. A `STAGED` version is verified and staged,
 but the checkpoint files still hold an earlier version, and every delta since is
-staged as well; see [Install before rewrite](#install-before-rewrite). `active.json` changes only
-after engine installation succeeds, so a failed download, reconstruction, or
-install retains the previous active engine version. The cache lock coordinates
-artifact mutations. The installation lock is held shared by concurrent
-co-located installers and exclusively by preparation, preventing another
-preparation from entering before activation.
+staged as well; see [Install before rewrite](#install-before-rewrite).
+`active.json` changes only after engine installation succeeds, so a failed
+download, reconstruction, or install retains the previous active engine version.
+The cache lock coordinates artifact mutations. The installation lock is held
+shared by concurrent co-located installers and exclusively by preparation,
+preventing another preparation from entering before activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-MX-model-name>/
@@ -365,7 +367,10 @@ Peer installs, bounded tensor streaming, and failed installs leave the live
 version unknown, so the next checkpoint install is a full reload.
 Delta lineage uses registry version IDs validated during replay. Writer versions
 in cached XOR index metadata may differ from those IDs and do not determine
-surgical reload eligibility.
+surgical reload eligibility. `perf/mx_receive_surgical_tensors` counts the
+checkpoint tensors a surgical install feeds, and
+`perf/mx_receive_surgical_fallback` is 1 when it loads the rest of the
+checkpoint.
 
 All ranks sharing one host filesystem can share the same cache. Each host without
 a shared filesystem needs its own cache.
@@ -417,8 +422,8 @@ The corresponding generator configuration would use:
 gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
 `deltas/`, `materialized/`, and `staging/`. It defaults to 2000 GB; set it to
 `null` to disable the configured quota. Writing staged deltas into a full
-checkpoint's files needs room for one more copy of them, since full checkpoints
-never change; see [Install before rewrite](#install-before-rewrite).
+checkpoint's files needs room for one more copy of them; see
+[Install before rewrite](#install-before-rewrite).
 At initialization, ModelExpress caps the quota at the existing model cache size
 plus available filesystem space. A short INFO log reports the cap and free space
 when this reduces the configured quota or replaces `null` with a disk-based
@@ -716,8 +721,8 @@ sequenceDiagram
   version registers, the cache adopts the result by renaming it. If another
   version is requested instead, the speculative delta is applied again to
   restore its base exactly, since an XOR delta is its own inverse.
-- Speculation is one delta deep and covers deltas only. Full checkpoints are
-  prepared after registration.
+- Speculation is one delta deep; full checkpoints are prepared only after
+  registration.
 - Engine ranks release the cache between preparing a target and installing it,
   and preparation can rewrite a derived checkpoint in place. The prefetcher
   therefore moves the cache head only after the engine activates it, or when the
@@ -738,8 +743,7 @@ sequenceDiagram
   faster than a peer transfer of the whole model.
 - Activating a version asks the prefetcher to poll at once, so it can move the
   head without waiting for its next interval.
-- The prefetcher writes its last outcome to `prefetch.json` in the model's cache
-  directory. It runs at a lower CPU priority and exits with the engine process.
+- The prefetcher runs at a lower CPU priority and exits with the engine process.
 
 ## In-place install
 
@@ -796,18 +800,22 @@ flowchart LR
   reloading them.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
 - Checkpoint headers are parsed once per process. Deltas never change them, so
-  each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
-  `perf/mx_receive_inplace_plan_time`, `perf/mx_receive_inplace_expert_time`, and
-  `perf/mx_receive_inplace_generic_time` split the install.
-  `perf/mx_receive_inplace_expert_wait_time` is the part of the expert time
-  spent waiting for staged bytes to be read, and
+  each update reuses the previous index. `perf/mx_receive_inplace_time` is the
+  time of the whole install, which `perf/mx_receive_inplace_index_time`,
+  `perf/mx_receive_inplace_plan_time`, `perf/mx_receive_inplace_expert_time`,
+  `perf/mx_receive_inplace_generic_time`, and
+  `perf/mx_receive_inplace_value_time` split.
+  `perf/mx_receive_inplace_expert_layers` counts the routed-expert layers
+  installed, and `perf/mx_receive_inplace_generic_tensors` the tensors fed
+  through the layerwise reload. `perf/mx_receive_inplace_expert_wait_time` is
+  the part of the expert time spent waiting for staged bytes to be read, and
   `perf/mx_receive_inplace_input_time` the part of the generic time spent
   building the reload's inputs. `perf/mx_receive_inplace_sparse_expert_layers`,
   `perf/mx_receive_inplace_sparse_expert_bytes` and
   `perf/mx_receive_inplace_sparse_scale_tensors` count the sparse writes, and
   `perf/mx_receive_inplace_sparse_layout_time` the time spent deriving their
-  maps. `perf/mx_receive_inplace_value_tensors` and
-  `perf/mx_receive_inplace_value_time` cover the modules reloaded from values.
+  maps. `perf/mx_receive_inplace_value_tensors` counts the tensors of the
+  modules reloaded from values.
 - After the engine starts, it holds `initial_serving_version_id` when the
   orchestrator passes one, and otherwise `initial_base_version_id`. The first
   delta from that version installs in place, or surgically, without a full
@@ -853,11 +861,12 @@ stateDiagram-v2
   `MX_REFIT_DELTA_WORKERS` threads without the GIL. Where the head's checksum of
   a tensor is known, it reads the tensor only at the bytes the delta changes:
   Adler-32 is linear in the bytes, so the old and new bytes there turn the head's
-  checksum into the target's. It reads in full the other tensors, every tensor
-  in one of every eight deltas, and a tensor whose sparse check misses, which
-  rejects the delta only if the full read misses too. Without the extension, or
-  with `MX_REFIT_NATIVE_CHECK=false`, Python reads every tensor in full, several
-  times slower.
+  checksum into the target's. It reads in full the other tensors and a tensor
+  whose sparse check misses, which rejects the delta only if the full read
+  misses too. It also reads each tensor in full in one of every eight deltas,
+  staggered by name so that each delta reads about an eighth of them. Without
+  the extension, or with `MX_REFIT_NATIVE_CHECK=false`, Python reads every
+  tensor in full, several times slower.
 - The checked target checksums, over the head's for tensors the delta leaves
   alone, become the target's table. A verified full download starts the tables;
   a seed copied from `seed_checkpoint_path` has none, so the first delta reads
@@ -882,8 +891,10 @@ stateDiagram-v2
   the reload sees the target's bytes.
 - Any other preparation, such as a chain of several deltas, or a caller that
   needs the target's own files, writes the staged deltas into the files first.
-- While files are rewritten in place, the head is `UPDATING`, so a crash makes
-  the next initialization rebuild it from its lineage. Deltas staged on a full
+- While files are rewritten in place, the head is `UPDATING`, so after a crash
+  the next initialization restores the initial full checkpoint, and the next
+  update rebuilds its target from the lineage; see
+  [`refit_checkpoint_dir`](#refit_checkpoint_dir). Deltas staged on a full
   checkpoint are always written into a copy, since full checkpoints never
   change. A crash or failure during a rewrite into a copy leaves the head
   `STAGED`, and the next initialization removes the partial copy.
