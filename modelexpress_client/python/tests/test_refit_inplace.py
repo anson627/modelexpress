@@ -16,7 +16,7 @@ import safetensors.numpy
 import torch
 from safetensors.torch import load_file, save_file
 
-from modelexpress_rl import ObjectStorageGeneratorConfig, ObjectStorageType, WeightPayloadFormat
+from modelexpress_rl import ObjectStorageGeneratorConfig, ObjectStorageType
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.checkpoint_store import CheckpointState
 from modelexpress_rl.inference.engines.vllm import inplace as inplace_module
@@ -31,16 +31,17 @@ from modelexpress_rl.inference.staging import (
     nonzero_bytes,
     write_staging,
 )
-from modelexpress_rl.utils import (
-    checksum_factory,
-    compress_delta,
-    compute_delta,
-    index_checkpoint_tensors,
+from modelexpress_rl.utils import compress_delta, compute_delta, index_checkpoint_tensors
+from tests.refit_fixtures import (
+    PREFIX,
+    SHARD,
+    _bytes,
+    _checksum,
+    _delta,
+    _delta_snapshot,
+    _FakeS3,
+    _uri,
 )
-
-PREFIX = "s3://weights/hotload"
-INDEX = "model.safetensors.index.json"
-SHARD = "model-00000-of-00001.safetensors"
 
 
 def _stage(directory, tensors, base="base"):
@@ -160,52 +161,6 @@ def test_large_tensors_stage_wide_offsets():
     assert large.dtype == np.uint64 and large.tolist() == [1 << 32]
 
 
-def _bytes(values):
-    return torch.tensor(values).contiguous().reshape(-1).view(torch.uint8).numpy()
-
-
-def _checksum(value):
-    checksum = checksum_factory("adler32")
-    checksum.update(value)
-    return checksum.hexdigest()
-
-
-def _uri(identity):
-    return f"{PREFIX}/{identity}/{INDEX}"
-
-
-def _delta_snapshot(base, target, *, identity, base_identity):
-    delta, _ = compute_delta(_bytes(target), _bytes(base))
-    shard = safetensors.numpy.save(
-        {"weight": compress_delta(delta)},
-        metadata={"weight": _checksum(_bytes(target))},
-    )
-    index = json.dumps(
-        {
-            "metadata": {
-                "version": identity,
-                "base_version": base_identity,
-                "delta_encoding": "xor",
-                "compression_format": "zstd",
-                "checksum_format": "adler32",
-            },
-            "weight_map": {"weight": SHARD},
-        }
-    ).encode()
-    return {_uri(identity): index, f"{PREFIX}/{identity}/{SHARD}": shard}
-
-
-class _FakeS3:
-    def __init__(self, objects):
-        self.objects = dict(objects)
-
-    def get(self, uri):
-        return self.objects[uri]
-
-    def close(self):
-        pass
-
-
 def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None, stage_deltas=True):
     launch = tmp_path / "launch"
     if not launch.exists():
@@ -230,15 +185,6 @@ def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None, stage_deltas=Tru
     if initialize:
         checkpoint.initialize()
     return checkpoint
-
-
-def _delta(version_id, *, base, identity):
-    return receiver_module._S3Version(
-        version_id=version_id,
-        base_version_id=base,
-        payload_format=WeightPayloadFormat.XOR_DELTA,
-        uri=_uri(identity),
-    )
 
 
 def test_delta_preparation_stages_nothing_for_an_engine_that_reloads(tmp_path):

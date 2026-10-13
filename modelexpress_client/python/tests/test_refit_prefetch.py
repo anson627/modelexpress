@@ -14,7 +14,6 @@ from unittest.mock import Mock
 
 import grpc
 import pytest
-import safetensors.numpy
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -40,75 +39,7 @@ from modelexpress_rl.inference.client import ModelExpressGeneratorClient
 from modelexpress_rl.inference.methods import CanonicalDeltaUpdateMethod
 from modelexpress_rl.inference.session import WeightUpdateSession
 from modelexpress_rl.s3 import S3Client
-from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
-
-PREFIX = "s3://weights/hotload"
-INDEX = "model.safetensors.index.json"
-SHARD = "model-00000-of-00001.safetensors"
-
-
-def _bytes(values):
-    return torch.tensor(values).contiguous().reshape(-1).view(torch.uint8).numpy()
-
-
-def _checksum(value):
-    checksum = checksum_factory("adler32")
-    checksum.update(value)
-    return checksum.hexdigest()
-
-
-def _uri(identity):
-    return f"{PREFIX}/{identity}/{INDEX}"
-
-
-def _delta_snapshot(base, target, *, identity, base_identity, version=None):
-    delta, _ = compute_delta(_bytes(target), _bytes(base))
-    shard = safetensors.numpy.save(
-        {"weight": compress_delta(delta)},
-        metadata={"weight": _checksum(_bytes(target))},
-    )
-    index = json.dumps(
-        {
-            "metadata": {
-                "version": version or identity,
-                "base_version": base_identity,
-                "delta_encoding": "xor",
-                "compression_format": "zstd",
-                "checksum_format": "adler32",
-            },
-            "weight_map": {"weight": SHARD},
-        }
-    ).encode()
-    return {_uri(identity): index, f"{PREFIX}/{identity}/{SHARD}": shard}
-
-
-class _FakeS3:
-    def __init__(self, objects):
-        self.objects = dict(objects)
-        self.gets = []
-
-    def get(self, uri):
-        self.gets.append(uri)
-        return self.objects[uri]
-
-    def size(self, uri):
-        return len(self.objects[uri])
-
-    def exists(self, uri):
-        return uri in self.objects
-
-    def list_children(self, prefix_uri, *, start_after=None):
-        prefix = prefix_uri.rstrip("/") + "/"
-        names = {
-            key[len(prefix) :].split("/", 1)[0]
-            for key in self.objects
-            if key.startswith(prefix) and "/" in key[len(prefix) :]
-        }
-        return sorted(name for name in names if start_after is None or name > start_after)
-
-    def close(self):
-        pass
-
+from tests.refit_fixtures import PREFIX, SHARD, _delta, _delta_snapshot, _FakeS3, _uri
 
 class _FakeRefit:
     def __init__(self):
@@ -187,15 +118,6 @@ def _settings(tmp_path, *, s3_watch=False, staged=False):
         s3_watch=s3_watch,
         parent_pid=os.getpid(),
         staged=staged,
-    )
-
-
-def _delta(version_id, *, base, identity):
-    return receiver_module._S3Version(
-        version_id=version_id,
-        base_version_id=base,
-        payload_format=WeightPayloadFormat.XOR_DELTA,
-        uri=_uri(identity),
     )
 
 
