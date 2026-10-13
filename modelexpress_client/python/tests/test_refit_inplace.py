@@ -161,6 +161,23 @@ def test_staged_bytes_rebuild_the_dense_delta(tmp_path, device):
     staged.close()
 
 
+def test_input_budget_builds_inputs_on_the_host_while_held_ones_fill_the_room():
+    device = torch.device("meta")
+    budget = inplace_module.InputBudget(device, 100)
+
+    first = torch.empty(60, dtype=torch.uint8, device=budget.device(60))
+    budget.hold(first)
+    assert first.device == device
+    assert budget.device(60) == torch.device("cpu")
+    # A loader may hold only a view of an input.
+    view = first.view(torch.int16).view(5, 6)
+    del first
+    assert budget.device(60) == torch.device("cpu")
+    del view
+    assert budget.device(60) == device
+    assert budget.host_bytes == 120
+
+
 def test_large_tensors_stage_wide_offsets():
     small, _ = join_nonzero(16, [(np.array([3]), np.array([1], dtype=np.uint8))])
     large, _ = join_nonzero(1 << 33, [(np.array([1 << 32]), np.array([1], dtype=np.uint8))])
@@ -1072,6 +1089,8 @@ def test_generic_install_handles_loaders_that_write_live_storage(monkeypatch, tm
 
     layer = model.layers[0]
     assert metrics["perf/mx_receive_inplace_generic_tensors"] == 1
+    # Both reloads build the 16-byte input in host memory on a CPU device.
+    assert metrics["perf/mx_receive_inplace_host_input_bytes"] == 32
     assert layer.weight.tolist() == [1, 2 ^ 5, 3, 4 ^ 1]
     assert layer.mirror.tolist() == [9, 8 ^ 5, 7, 6 ^ 1]
     staged.close()
