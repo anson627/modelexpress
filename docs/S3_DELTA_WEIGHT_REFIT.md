@@ -867,8 +867,9 @@ stateDiagram-v2
 - Deltas stay staged until there are `MX_REFIT_STAGED_LAYERS` of them (default
   8). Once the engine has activated a head at that limit, the prefetcher writes
   its staged deltas into the files, which makes the head `READY`. A delta on top
-  of the head that arrives meanwhile joins that pass and becomes the only one
-  staged on the rewritten files. The prefetcher sees such a delta in the
+  of the head that arrives meanwhile joins that pass, unless its preparation
+  from that head already failed, and becomes the only one staged on the
+  rewritten files. The prefetcher sees such a delta in the
   registry or the S3 watch, or from `want.json`, which an engine writes while it
   waits to prepare a target. A delta prepared at the limit before the
   prefetcher starts writes the staged deltas in its own pass the same way.
