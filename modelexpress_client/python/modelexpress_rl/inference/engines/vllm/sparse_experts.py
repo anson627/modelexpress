@@ -109,8 +109,9 @@ class ExpertLayout:
 
     ``maps[(proj, kind)][e]`` is the live element, within the expert's slot of
     the tensor that kind loads into, of checkpoint element ``e``, or -1 when
-    another rank owns it. ``sources`` lists the elements this rank owns, and
-    ``floor`` is the value processing clamps scales up to, 0 if none.
+    another rank owns it. ``sources[(proj, SCALE)]`` lists the scale elements
+    this rank owns, in order, and ``floor`` is the value processing clamps
+    scales up to, 0 if none.
     """
 
     maps: dict[tuple[str, str], torch.Tensor]
@@ -199,7 +200,8 @@ def derive_layout(
         mapping = torch.full((numel,), -1, dtype=torch.int64, device=device)
         mapping[source] = owned
         maps[(proj, kind)] = mapping
-        sources[(proj, kind)] = torch.sort(source).values
+        if kind == SCALE:
+            sources[(proj, kind)] = torch.sort(source).values
     # Zero scales come back as whatever processing clamps them to.
     zeros = run("gate", SCALE, torch.zeros(shapes[("gate", SCALE)], device=device))
     floors = torch.unique(torch.cat([zeros[2].reshape(-1), zeros[3].reshape(-1)]))

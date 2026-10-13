@@ -221,13 +221,18 @@ def test_layout_maps_owned_elements_and_finds_the_scale_clamp(fake_oracle):
     layout = sparse_experts.derive_layout(experts, shapes, torch.device("cpu"))
 
     assert layout.floor == pytest.approx(1e-10)
-    for (proj, kind), source in layout.sources.items():
+    # Only scale writes read the owned elements' list.
+    assert set(layout.sources) == {(proj, sparse_experts.SCALE) for proj in ("gate", "up", "down")}
+    for (proj, kind), mapping in layout.maps.items():
+        source = torch.nonzero(mapping >= 0, as_tuple=True)[0]
+        if kind == sparse_experts.SCALE:
+            assert torch.equal(layout.sources[(proj, kind)], source)
         target = sparse_experts._target(proj, kind)
         live = sparse_experts.live_tensors(experts)[target]
         checkpoint = base[f"{PREFIX}.1.{proj}_proj.{kind}"].reshape(-1)
         # Every owned element sits where the map says, and the rank owns half.
         assert source.numel() == checkpoint.numel() // TP
-        placed = live[1].reshape(-1)[layout.maps[(proj, kind)][source]]
+        placed = live[1].reshape(-1)[mapping[source]]
         expected = checkpoint[source]
         assert torch.equal(placed, expected.clamp(min=1e-10) if kind == "weight_scale_inv" else expected)
 
