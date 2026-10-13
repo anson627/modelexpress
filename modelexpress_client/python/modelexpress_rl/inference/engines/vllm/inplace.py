@@ -24,7 +24,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,8 @@ import numpy as np
 import torch
 from modelexpress.gds_loader import SAFETENSORS_DTYPE_MAP
 from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from modelexpress_rl.inference.engines.vllm import sparse_experts
 from modelexpress_rl.inference.engines.vllm.surgical import checkpoint_module, module_groups
@@ -41,6 +43,7 @@ from modelexpress_rl.inference.staging import (
     VALUES_FILE,
     StagedDelta,
     StagedTensor,
+    staged_window,
 )
 from modelexpress_rl.utils import index_checkpoint_tensors
 
@@ -184,6 +187,105 @@ class InputBudget:
         if tensor.device.type != "cpu":
             self._held.append((StorageWeakRef(tensor.untyped_storage()), tensor.nbytes))
             self._held_bytes += tensor.nbytes
+
+
+# Bytes of a storage as rows of one length: (start, rows, stride, length).
+Box = tuple[int, int, int, int]
+
+
+def read_box(tensor: torch.Tensor) -> Box | None:
+    """The bytes of its storage that reading ``tensor`` covers, if they form rows of one length."""
+    size = tensor.element_size()
+    start = tensor.storage_offset() * size
+    dims = [(count, stride * size) for count, stride in zip(tensor.shape, tensor.stride()) if count != 1]
+    if any(count == 0 for count, _stride in dims):
+        return start, 0, 0, 0
+    length = size
+    while dims and dims[-1][1] == length:
+        length *= dims.pop()[0]
+    if not dims:
+        return start, 1, length, length
+    if len(dims) == 1 and dims[0][1] > length:
+        return start, dims[0][0], dims[0][1], length
+    return None
+
+
+def one_range(boxes: set[Box]) -> bool:
+    """Whether ``boxes`` are one contiguous range of bytes."""
+    return len(boxes) == 1 and all(stride == length for _start, _rows, stride, length in boxes)
+
+
+def staged_within(staged: StagedTensor, boxes: Sequence[Box]) -> StagedTensor:
+    """The part of a tensor's staged bytes that falls inside ``boxes``."""
+    picks: list[slice | np.ndarray] = []
+    for start, rows, stride, length in boxes:
+        if rows == 0:
+            continue
+        first, last = staged_window(staged, start, start + (rows - 1) * stride + length)
+        if stride == length:
+            picks.append(slice(first, last))
+        else:
+            offsets = staged.positions[first:last].astype(np.int64) - start
+            picks.append(first + np.flatnonzero(offsets % stride < length))
+    if len(picks) == 1:
+        pick = picks[0]
+    else:
+        pick = np.unique(
+            np.concatenate(
+                [np.arange(p.start, p.stop) if isinstance(p, slice) else p for p in picks]
+                or [np.empty(0, dtype=np.int64)]
+            )
+        )
+    return StagedTensor(staged.nbytes, staged.positions[pick], staged.values[pick])
+
+
+class InputReads(TorchDispatchMode):
+    """Records which bytes of each reload input the loaders read.
+
+    Every operation on an input other than a view reads it. A read that covers
+    no rows of one length marks the whole input as read.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Inputs by storage address. Memory an input frees can hold another tensor
+        # later, so an entry counts only while the input's storage lives.
+        self._inputs: dict[int, tuple[str, StorageWeakRef]] = {}
+        self.boxes: dict[str, set[Box] | None] = {}
+
+    def track(self, name: str, tensor: torch.Tensor) -> None:
+        """Record the reads of ``tensor``, the input built for ``name``."""
+        self.boxes.setdefault(name, set())
+        if tensor.nbytes:
+            storage = tensor.untyped_storage()
+            self._inputs[storage.data_ptr()] = (name, StorageWeakRef(storage))
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if not func.is_view:
+            for arg in pytree.tree_leaves((args, kwargs)):
+                if (
+                    not isinstance(arg, torch.Tensor)
+                    or arg.layout != torch.strided
+                    or arg.device.type == "meta"
+                ):
+                    continue
+                address = arg.untyped_storage().data_ptr()
+                entry = self._inputs.get(address)
+                if entry is None:
+                    continue
+                name, storage = entry
+                if storage.expired():
+                    del self._inputs[address]
+                    continue
+                boxes = self.boxes[name]
+                if boxes is not None:
+                    box = read_box(arg)
+                    if box is None:
+                        self.boxes[name] = None
+                    else:
+                        boxes.add(box)
+        return func(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -802,6 +904,9 @@ class InPlaceInstaller:
         self._sparse_rejected: dict[int, str] = {}
         # Whether each generic tensor's module needs its values, reset with the catalog.
         self._needs_values: dict[str, bool] = {}
+        # The bytes of each generic tensor this rank's loaders read, None for all of
+        # them, reset with the catalog.
+        self._input_reads: dict[str, set[Box] | None] = {}
         self._packed: dict[str, list[str]] = {}
         for module in model.modules():
             self._packed.update(getattr(module, "packed_modules_mapping", None) or {})
@@ -1100,6 +1205,7 @@ class InPlaceInstaller:
         if self._catalog is None or self._catalog[0] is not metadata:
             self._catalog = (metadata, CheckpointCatalog.of(metadata))
             self._needs_values = {}
+            self._input_reads = {}
         return self._catalog[1]
 
     def _served(self, key: int | None) -> bool:
@@ -1169,6 +1275,13 @@ class InPlaceInstaller:
 
         budget = self._input_budget(max(metadata[name]["byte_size"] for name in fed))
         input_seconds = 0.0
+        # Each rank's loaders read only its shard of most inputs. The zero pass
+        # records which bytes they read, and inputs built in host memory, where
+        # every page written faults, carry only those. On the GPU, selecting
+        # staged bytes costs more than writing them all, unless they are one
+        # range of the staged offsets.
+        reads = self._input_reads
+        recorder = InputReads() if any(name not in reads for name in fed) else None
 
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
             nonlocal input_seconds
@@ -1176,12 +1289,21 @@ class InPlaceInstaller:
                 info = metadata[name]
                 started = time.perf_counter()
                 delta = None if zero or name not in staged_names else staged.tensor(name)
-                data = staged_bytes(info["byte_size"], delta, budget.device(info["byte_size"]))
+                device = budget.device(info["byte_size"])
+                read = reads.get(name)
+                if delta is not None and read is not None and (device.type == "cpu" or one_range(read)):
+                    delta = staged_within(delta, sorted(read))
+                data = staged_bytes(info["byte_size"], delta, device)
                 budget.hold(data)
+                if recorder is not None and zero:
+                    recorder.track(name, data)
                 input_seconds += time.perf_counter() - started
                 yield name, data.view(SAFETENSORS_DTYPE_MAP[info["dtype"]]).view(info["shape"])
 
-        self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
+        with recorder or nullcontext():
+            self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
+        if recorder is not None:
+            reads.update(recorder.boxes)
         # XOR the original back into every tensor the zero pass changed, after
         # both passes. A tensor a loader overwrote then ends as original ^ delta;
         # for one the XOR restore changed, the two extra XORs cancel.
@@ -1293,15 +1415,19 @@ __all__ = [
     "InPlaceInstaller",
     "InPlaceUnsupported",
     "InputBudget",
+    "InputReads",
     "Peers",
     "StagedPlacement",
     "StagedRunReader",
     "arrange_expert_delta",
     "bits",
     "fp8_moe_unsupported",
+    "one_range",
     "process_like_weights",
+    "read_box",
     "staged_bytes",
     "staged_runs",
+    "staged_within",
     "xor_into",
     "xor_restore",
 ]

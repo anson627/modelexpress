@@ -28,6 +28,7 @@ from modelexpress_rl.inference.staging import (
     POSITIONS_FILE,
     VALUES_FILE,
     StagedDelta,
+    StagedTensor,
     join_nonzero,
     nonzero_bytes,
     write_staging,
@@ -176,6 +177,46 @@ def test_input_budget_builds_inputs_on_the_host_while_held_ones_fill_the_room():
     del view
     assert budget.device(60) == device
     assert budget.host_bytes == 120
+
+
+def test_read_box_covers_the_bytes_a_view_reads():
+    full = torch.zeros(4, 6, dtype=torch.bfloat16)
+
+    assert inplace_module.read_box(full) == (0, 1, 48, 48)
+    assert inplace_module.read_box(full.narrow(0, 2, 2)) == (24, 1, 24, 24)
+    assert inplace_module.read_box(full.narrow(1, 3, 3)) == (6, 4, 12, 6)
+    assert inplace_module.read_box(full[1, 2]) == (16, 1, 2, 2)
+    assert inplace_module.read_box(full.narrow(0, 1, 0))[1] == 0
+    assert inplace_module.read_box(full.t()) is None
+
+
+def test_staged_within_keeps_the_staged_bytes_inside_the_boxes():
+    positions = np.array([0, 5, 7, 12, 13, 20, 30, 47], dtype=np.uint32)
+    staged = StagedTensor(48, positions, np.arange(1, 9, dtype=np.uint8))
+
+    # Bytes 6-11, 18-23, 30-35 and 42-47.
+    rows = inplace_module.staged_within(staged, [(6, 4, 12, 6)])
+    block = inplace_module.staged_within(staged, [(12, 1, 24, 24)])
+    both = inplace_module.staged_within(staged, [(0, 1, 6, 6), (6, 4, 12, 6)])
+
+    assert rows.positions.tolist() == [7, 20, 30, 47]
+    assert rows.values.tolist() == [3, 6, 7, 8]
+    assert block.positions.tolist() == [12, 13, 20, 30]
+    assert both.positions.tolist() == [0, 5, 7, 20, 30, 47]
+    assert inplace_module.staged_within(staged, []).positions.size == 0
+
+
+def test_input_reads_record_the_bytes_operations_read():
+    data = torch.zeros(48, dtype=torch.uint8)
+    other = torch.zeros(48, dtype=torch.uint8)
+
+    with inplace_module.InputReads() as reads:
+        reads.track("weight", data)
+        reads.track("other", other)
+        torch.empty(4, 3, dtype=torch.bfloat16).copy_(data.view(torch.bfloat16).view(4, 6).narrow(1, 3, 3))
+        other.view(torch.bfloat16).view(4, 6).t().contiguous()
+
+    assert reads.boxes == {"weight": {(6, 4, 12, 6)}, "other": None}
 
 
 def test_large_tensors_stage_wide_offsets():
@@ -1093,6 +1134,96 @@ def test_generic_install_handles_loaders_that_write_live_storage(monkeypatch, tm
     assert metrics["perf/mx_receive_inplace_host_input_bytes"] == 32
     assert layer.weight.tolist() == [1, 2 ^ 5, 3, 4 ^ 1]
     assert layer.mirror.tolist() == [9, 8 ^ 5, 7, 6 ^ 1]
+    staged.close()
+
+
+class _ShardModel(torch.nn.Module):
+    """Loads a rank's shard of its one 4x2 input along ``dim`` by XORing it into live storage."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        live = [[1, 2], [3, 4]] if dim == 0 else [[1], [2], [3], [4]]
+        self.layers = torch.nn.ModuleList([torch.nn.Module()])
+        self.layers[0].weight = torch.nn.Parameter(torch.tensor(live, dtype=torch.int32), requires_grad=False)
+        self.inputs = []
+
+    def load_weights(self, weights):
+        for _name, tensor in weights:
+            self.inputs.append(tensor)
+            shard = tensor.narrow(0, 2, 2) if self.dim == 0 else tensor.narrow(1, 1, 1)
+            self.layers[0].weight.data.bitwise_xor_(shard)
+
+
+def _shard_install(monkeypatch, tmp_path, dim):
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
+    model = _ShardModel(dim)
+    installer = inplace_module.InPlaceInstaller(
+        model, device=torch.device("cpu"), generic_reload=lambda load: load(None)
+    )
+    name = "model.layers.0.proj.weight"
+    checkpoint = _save(tmp_path / "checkpoint", {name: torch.zeros(4, 2, dtype=torch.int32)})
+    # Nonzero staged bytes at offsets 0, 12, 16 and 28.
+    delta = torch.tensor([[7, 0], [0, 7], [5, 0], [0, 1]], dtype=torch.int32)
+    staged = _stage(
+        tmp_path / "staging",
+        {name: (np.zeros(32, dtype=np.uint8), delta.view(torch.uint8).numpy().reshape(-1))},
+    )
+    return model, installer, name, checkpoint, staged
+
+
+@pytest.mark.parametrize(
+    ("dim", "read", "built", "installed"),
+    [
+        # Rows 2 and 3, bytes 16-31.
+        (0, (16, 1, 16, 16), [[0, 0], [0, 0], [5, 0], [0, 1]], [[1 ^ 5, 2], [3, 4 ^ 1]]),
+        # Column 1, bytes 4-7 of each 8-byte row.
+        (1, (4, 4, 8, 4), [[0, 0], [0, 7], [0, 0], [0, 1]], [[1], [2 ^ 7], [3], [4 ^ 1]]),
+    ],
+    ids=["rows", "columns"],
+)
+def test_generic_install_builds_only_the_bytes_loaders_read_in_host_memory(
+    monkeypatch, tmp_path, dim, read, built, installed
+):
+    recorders = []
+    record = inplace_module.InputReads
+    monkeypatch.setattr(inplace_module, "InputReads", lambda: recorders.append(record()) or recorders[-1])
+    model, installer, name, checkpoint, staged = _shard_install(monkeypatch, tmp_path, dim)
+
+    installer._install(checkpoint, staged)
+    assert model.layers[0].weight.tolist() == installed
+    installer._install(checkpoint, staged)
+
+    # The zero pass of the first install records the read; the delta passes build only it.
+    assert len(recorders) == 1
+    assert installer._input_reads == {name: {read}}
+    for delta_input in model.inputs[1::2]:
+        assert delta_input.tolist() == built
+    assert model.layers[0].weight.tolist() == _ShardModel(dim).layers[0].weight.tolist()
+    staged.close()
+
+
+@pytest.mark.parametrize(("dim", "positions"), [(0, [16, 28]), (1, [0, 12, 16, 28])], ids=["rows", "columns"])
+def test_generic_install_builds_device_inputs_from_one_range_of_staged_bytes(monkeypatch, tmp_path, dim, positions):
+    model, installer, _name, checkpoint, staged = _shard_install(monkeypatch, tmp_path, dim)
+    installer._install(checkpoint, staged)
+    built = []
+    build = inplace_module.staged_bytes
+
+    def on_host(nbytes, delta, device, **kwargs):
+        built.append(None if delta is None else delta.positions.tolist())
+        return build(nbytes, delta, torch.device("cpu"), **kwargs)
+
+    monkeypatch.setattr(inplace_module, "staged_bytes", on_host)
+    monkeypatch.setattr(
+        installer, "_input_budget", lambda largest: inplace_module.InputBudget(torch.device("meta"), 1 << 40)
+    )
+
+    installer._install(checkpoint, staged)
+
+    # Rows are one range of the staged offsets; columns would need selecting, so they come whole.
+    assert built == [None, positions]
+    assert model.layers[0].weight.tolist() == _ShardModel(dim).layers[0].weight.tolist()
     staged.close()
 
 

@@ -38,6 +38,7 @@ from modelexpress_rl.inference.staging import (
     StagedTensor,
     join_nonzero,
     nonzero_bytes,
+    staged_window,
     write_staging,
 )
 from modelexpress_rl.object_storage import ObjectStorageType
@@ -238,19 +239,9 @@ _Shards = dict[str, tuple[bytes, list[str]]]
 _StagedBytes = dict[str, tuple[int, np.ndarray, np.ndarray]]
 
 
-def _staged_window(staged: StagedTensor, begin: int, end: int) -> tuple[int, int]:
-    """Indices of a staged delta's bytes at tensor offsets ``[begin, end)``."""
-    # Bounds of the offsets' own type keep the search from converting them all.
-    kind = staged.positions.dtype.type
-    first = int(np.searchsorted(staged.positions, kind(begin)))
-    if end >= staged.nbytes:
-        return first, staged.positions.size
-    return first, int(np.searchsorted(staged.positions, kind(end)))
-
-
 def _xor_staged(target: np.ndarray, staged: StagedTensor, position: int) -> None:
     """XOR a staged delta's nonzero bytes into the block of its tensor at ``position``."""
-    begin, end = _staged_window(staged, position, position + target.size)
+    begin, end = staged_window(staged, position, position + target.size)
     target[staged.positions[begin:end] - position] ^= staged.values[begin:end]
 
 
