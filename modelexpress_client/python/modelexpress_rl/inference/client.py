@@ -13,7 +13,6 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any, Literal
 
 import grpc
@@ -30,9 +29,10 @@ from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
+from .checkpoint_store import LocalCheckpointStore
 from .methods.canonical_delta import CanonicalDeltaUpdateMethod
 from .plan import WeightSource, parse_weight_source_order
-from .prefetch import POLL_SECONDS, PrefetchSettings, launch_prefetcher, notify_prefetcher
+from .prefetch import POLL_SECONDS, PrefetchSettings, launch_prefetcher
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -263,7 +263,7 @@ class ModelExpressGeneratorClient:
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._prefetcher: subprocess.Popen | None = None
-        self._prefetch_cache_dir: Path | None = None
+        self._prefetch_store: LocalCheckpointStore | None = None
         self._closed = False
 
     @classmethod
@@ -360,8 +360,8 @@ class ModelExpressGeneratorClient:
 
     def notify_prefetch(self) -> None:
         """Ask the host prefetcher to look for new versions now."""
-        if self._prefetch_cache_dir is not None:
-            notify_prefetcher(self._prefetch_cache_dir)
+        if self._prefetch_store is not None:
+            self._prefetch_store.notify_prefetcher()
 
     def _start_prefetcher(self, config: ModelExpressGeneratorConfig) -> None:
         canonical = next(
@@ -397,7 +397,7 @@ class ModelExpressGeneratorClient:
             staged=canonical.staged_checkpoints,
             streamed=canonical.stream_full_checkpoints,
         )
-        self._prefetch_cache_dir = settings.cache_dir()
+        self._prefetch_store = settings.store()
         # One process per host cache; extra co-located ranks exit at once.
         self._prefetcher = launch_prefetcher(
             settings, workers=rl_envs.MX_REFIT_PREFETCH_WORKERS
@@ -405,7 +405,7 @@ class ModelExpressGeneratorClient:
         logger.info(
             "ModelExpress refit prefetch started pid=%s cache=%s s3_watch=%s",
             self._prefetcher.pid,
-            self._prefetch_cache_dir,
+            self._prefetch_store.cache,
             settings.s3_watch,
         )
 

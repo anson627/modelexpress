@@ -504,7 +504,7 @@ class LocalCheckpointStore:
         checkpoint_paths: Iterable[Path],
         source: dict[str, str] | None = None,
         base: str | None = None,
-    ) -> None:
+    ) -> CheckpointRecord:
         state = CheckpointRecord(
             status=status,
             version=version,
@@ -517,6 +517,7 @@ class LocalCheckpointStore:
             base=base,
         )
         self._write_json(self.state_path, state.to_dict())
+        return state
 
     def wanted(self) -> dict | None:
         """Return the target an engine waits to prepare, if any."""

@@ -100,11 +100,14 @@ class PrefetchSettings:
             region_name=self.region_name,
         )
 
-    def cache_dir(self) -> Path:
+    def store(self) -> LocalCheckpointStore:
         return LocalCheckpointStore(
             root=self.refit_checkpoint_dir,
             model_name=self.cache_model_name,
-        ).cache
+        )
+
+    def cache_dir(self) -> Path:
+        return self.store().cache
 
 
 def launch_prefetcher(settings: PrefetchSettings, *, workers: int) -> subprocess.Popen:
@@ -114,14 +117,6 @@ def launch_prefetcher(settings: PrefetchSettings, *, workers: int) -> subprocess
         [sys.executable, "-m", __name__, "--settings", json.dumps(asdict(settings))],
         env=environment,
     )
-
-
-def notify_prefetcher(cache_dir: Path) -> None:
-    """Ask a running prefetcher to poll now instead of at its next interval."""
-    try:
-        (cache_dir / TRIGGER_FILE).touch()
-    except OSError:
-        logger.debug("prefetch trigger is unavailable", exc_info=True)
 
 
 class RefitPrefetcher:
