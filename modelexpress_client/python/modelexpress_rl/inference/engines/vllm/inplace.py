@@ -1203,8 +1203,13 @@ class InPlaceInstaller:
 
 @contextmanager
 def xor_restore() -> Iterator[None]:
-    """Make layerwise reload XOR processed tensors into live storage instead of copying."""
-    from vllm.model_executor.model_loader.reload import layerwise
+    """Make layerwise reload XOR processed tensors into live storage instead of copying.
+
+    Reload materializes each layer's tensors uninitialized, so elements no loader
+    writes, such as padding rows, would XOR whatever that memory held into live
+    storage. They are materialized as zeros instead and stay unchanged.
+    """
+    from vllm.model_executor.model_loader.reload import layerwise, meta
 
     def restore(layer: torch.nn.Module, info: Any) -> None:
         parameters, buffers = info.kernel_tensors
@@ -1225,12 +1230,21 @@ def xor_restore() -> Iterator[None]:
                 xor_into(buffer.data, current.data)
         layerwise._place_kernel_tensors(layer, info)
 
+    materialize = meta.materialize_meta_tensor
+
+    def materialize_zeros(meta_tensor: torch.Tensor) -> torch.Tensor:
+        tensor = materialize(meta_tensor)
+        tensor.data.zero_()
+        return tensor
+
     original = layerwise._copy_and_restore_kernel_tensors
     layerwise._copy_and_restore_kernel_tensors = restore
+    meta.materialize_meta_tensor = materialize_zeros
     try:
         yield
     finally:
         layerwise._copy_and_restore_kernel_tensors = original
+        meta.materialize_meta_tensor = materialize
 
 
 __all__ = [

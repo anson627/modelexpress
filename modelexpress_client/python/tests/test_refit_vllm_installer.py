@@ -92,19 +92,24 @@ def _install_fake_vllm(monkeypatch, initialize):
                     reset=lambda: None,
                 )
 
+    meta = modules["vllm.model_executor.model_loader.reload.meta"]
+
+    def materialize_meta_tensor(value):
+        return torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
+
+    # Like vLLM's, materializes each meta tensor through the module's function.
     def materialize_layer(layer, _info):
         for name, value in (*layer._parameters.items(), *layer._buffers.items()):
             if value is None or not value.is_meta:
                 continue
-            tensor = torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
+            tensor = meta.materialize_meta_tensor(value)
             if name in layer._parameters:
                 tensor = nn.Parameter(tensor, requires_grad=False)
             tensor.__dict__.update(value.__dict__)
             setattr(layer, name, tensor)
 
-    modules[
-        "vllm.model_executor.model_loader.reload.meta"
-    ].materialize_layer = materialize_layer
+    meta.materialize_meta_tensor = materialize_meta_tensor
+    meta.materialize_layer = materialize_layer
     modules["vllm.model_executor.layers.attention"].is_deferred_attention_layer = (
         lambda layer: getattr(layer, "deferred_attention", False)
     )
