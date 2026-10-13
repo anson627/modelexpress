@@ -32,7 +32,7 @@ from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .methods.canonical_delta import CanonicalDeltaUpdateMethod
 from .plan import WeightSource, parse_weight_source_order
-from .prefetch import PrefetchSettings, launch_prefetcher, notify_prefetcher
+from .prefetch import POLL_SECONDS, PrefetchSettings, launch_prefetcher, notify_prefetcher
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -391,7 +391,7 @@ class ModelExpressGeneratorClient:
             region_name=object_storage.region_name,
             max_replay_chain_length=self._max_replay_chain_length,
             rpc_timeout_seconds=self._rpc_timeout_seconds,
-            poll_seconds=rl_envs.MX_REFIT_PREFETCH_POLL_SECONDS,
+            poll_seconds=POLL_SECONDS,
             s3_watch=rl_envs.MX_REFIT_PREFETCH_S3_WATCH,
             parent_pid=os.getpid(),
             staged=canonical.staged_checkpoints,

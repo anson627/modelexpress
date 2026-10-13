@@ -1173,18 +1173,17 @@ are registered. See
 behavior and the related settings.
 
 `MX_REFIT_INPLACE=true` additionally installs a prepared delta into live vLLM
-weights in place instead of reloading every tensor; see
-[In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). Deltas are
-installed before the checkpoint files are rewritten, and `MX_REFIT_STAGED_LAYERS`
-(default `8`) bounds how many wait on the files at once. At that limit they are
-written into the files while the engine serves, which for a full checkpoint
-needs room in `refit_checkpoint_max_size_gb` for one more copy of its files. A
-delta's check reads a tensor with a verified checksum only where the delta
-changes it, and in full in one of every `MX_REFIT_FULL_CHECK_INTERVAL` deltas
-(default `8`; `1` always reads every tensor). The check runs in the C++ delta
-checker when the client was built with it; installs from source need a C++
-compiler and the zstd development files for that, and
-`MX_REFIT_NATIVE_CHECK=false` checks in Python instead. See
+weights in place instead of reloading every tensor; see [In-place
+install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). Deltas are installed before
+the checkpoint files are rewritten, and `MX_REFIT_STAGED_LAYERS` (default `8`)
+bounds how many wait on the files at once. At that limit they are written into
+the files while the engine serves, which for a full checkpoint needs room in
+`refit_checkpoint_max_size_gb` for one more copy of its files. A delta's check
+reads a tensor with a verified checksum only where the delta changes it, and in
+full in one of every eight deltas. The check runs in the C++ delta checker when
+the client was built with it; installs from source need a C++ compiler and the
+zstd development files for that, and `MX_REFIT_NATIVE_CHECK=false` checks in
+Python instead. See
 [Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
 For block-FP8 models on Blackwell, routed experts under vLLM's default
 FlashInfer TRT-LLM MoE backend take sparse writes, while FP8 linear layers under

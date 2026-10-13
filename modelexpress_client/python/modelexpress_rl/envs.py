@@ -36,11 +36,9 @@ if TYPE_CHECKING:
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_INPLACE: bool
     MX_REFIT_STAGED_LAYERS: int
-    MX_REFIT_FULL_CHECK_INTERVAL: int
     MX_REFIT_NATIVE_CHECK: bool
     MX_REFIT_PREFER_PREPARED: bool
     MX_REFIT_PREFETCH: bool
-    MX_REFIT_PREFETCH_POLL_SECONDS: float
     MX_REFIT_PREFETCH_S3_WATCH: bool
     MX_REFIT_PREFETCH_WORKERS: int
     MX_REFIT_FULL_STREAMING: bool
@@ -215,10 +213,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_REFIT_PREFETCH", "false"),
         "MX_REFIT_PREFETCH",
     ),
-    "MX_REFIT_PREFETCH_POLL_SECONDS": lambda: require_positive_float(
-        float(os.environ.get("MX_REFIT_PREFETCH_POLL_SECONDS", "2")),
-        "MX_REFIT_PREFETCH_POLL_SECONDS",
-    ),
     "MX_REFIT_PREFETCH_S3_WATCH": lambda: parse_bool(
         os.environ.get("MX_REFIT_PREFETCH_S3_WATCH", "false"),
         "MX_REFIT_PREFETCH_S3_WATCH",
@@ -237,9 +231,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Most deltas checked through staged bytes before a preparation writes the
     # checkpoint files.
     "MX_REFIT_STAGED_LAYERS": lambda: positive_int_env("MX_REFIT_STAGED_LAYERS", 8),
-    # A delta's check reads a tensor with a known checksum in full in one of this
-    # many deltas, and only its changed bytes otherwise. 1 reads every tensor.
-    "MX_REFIT_FULL_CHECK_INTERVAL": lambda: positive_int_env("MX_REFIT_FULL_CHECK_INTERVAL", 8),
     # Check deltas in the C++ extension when it is built.
     "MX_REFIT_NATIVE_CHECK": lambda: parse_bool(
         os.environ.get("MX_REFIT_NATIVE_CHECK", "true"),

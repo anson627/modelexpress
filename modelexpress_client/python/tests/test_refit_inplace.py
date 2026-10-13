@@ -206,7 +206,7 @@ class _FakeS3:
         pass
 
 
-def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None):
+def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None, stage_deltas=True):
     launch = tmp_path / "launch"
     if not launch.exists():
         launch.mkdir()
@@ -225,6 +225,7 @@ def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None):
             refit_checkpoint_max_size_gb=1,
         ),
         s3=s3,
+        stage_deltas=stage_deltas,
     )
     if initialize:
         checkpoint.initialize()
@@ -240,14 +241,9 @@ def _delta(version_id, *, base, identity):
     )
 
 
-@pytest.mark.parametrize("flag", [None, "false"])
-def test_delta_preparation_stages_nothing_by_default(monkeypatch, tmp_path, flag):
-    if flag is None:
-        monkeypatch.delenv("MX_REFIT_INPLACE", raising=False)
-    else:
-        monkeypatch.setenv("MX_REFIT_INPLACE", flag)
+def test_delta_preparation_stages_nothing_for_an_engine_that_reloads(tmp_path):
     s3 = _FakeS3(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
-    checkpoint = _checkpoint(tmp_path, s3)
+    checkpoint = _checkpoint(tmp_path, s3, stage_deltas=False)
 
     prepared = checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),))
 
@@ -256,7 +252,6 @@ def test_delta_preparation_stages_nothing_by_default(monkeypatch, tmp_path, flag
 
 
 def test_delta_preparation_stages_the_changed_bytes(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     s3 = _FakeS3(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
     checkpoint = _checkpoint(tmp_path, s3)
 
@@ -278,7 +273,6 @@ def test_delta_preparation_stages_the_changed_bytes(monkeypatch, tmp_path):
 
 
 def test_staging_follows_speculation_adoption_and_revert(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     objects = {
         **_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"),
         **_delta_snapshot([1.0, 3.0], [4.0, 3.0], identity="x", base_identity="v1"),
@@ -308,7 +302,6 @@ def test_staging_follows_speculation_adoption_and_revert(monkeypatch, tmp_path):
 
 
 def test_evicting_a_version_removes_its_staging(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     s3 = _FakeS3(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
     checkpoint = _checkpoint(tmp_path, s3)
     checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),))
@@ -358,7 +351,6 @@ def _lineage_snapshot(version, base):
 
 
 def _lineage_checkpoint(tmp_path, monkeypatch, *, layers=None):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     if layers is not None:
         monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", str(layers))
     objects = {}
@@ -470,7 +462,7 @@ def _sparse(prepared):
 def test_a_delta_reads_only_its_changed_bytes_from_known_checksums(monkeypatch, tmp_path):
     checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
     # No tensor sits out a sparse check at these chain depths.
-    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
+    monkeypatch.setattr(receiver_module, "_FULL_CHECK_INTERVAL", 1000)
     store = checkpoint.store
 
     first = checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True)
@@ -500,7 +492,7 @@ def test_a_delta_reads_only_its_changed_bytes_from_known_checksums(monkeypatch, 
 
 def test_a_wrong_delta_fails_after_its_sparse_check_misses(monkeypatch, tmp_path):
     checkpoint, s3 = _lineage_checkpoint(tmp_path, monkeypatch)
-    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", "1000")
+    monkeypatch.setattr(receiver_module, "_FULL_CHECK_INTERVAL", 1000)
     checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
     shard = safetensors.numpy.load(s3.objects[f"{PREFIX}/v2/{SHARD}"])
     checksums = {**_target_checksums("v2"), "a": "00000001"}
@@ -518,7 +510,7 @@ def test_a_wrong_delta_fails_after_its_sparse_check_misses(monkeypatch, tmp_path
 @pytest.mark.parametrize("interval", [1, 2])
 def test_each_tensor_is_read_in_full_once_per_check_interval(monkeypatch, tmp_path, interval):
     checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
-    monkeypatch.setenv("MX_REFIT_FULL_CHECK_INTERVAL", str(interval))
+    monkeypatch.setattr(receiver_module, "_FULL_CHECK_INTERVAL", interval)
     checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
     second = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
     checkpoint.activate(second)
@@ -1219,7 +1211,6 @@ class _InPlace:
 
 @pytest.fixture
 def staged_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
     monkeypatch.setattr(installer_module, "InPlaceInstaller", _InPlace)
     _InPlace.calls, _InPlace.error = [], None
     return PreparedCheckpoint("v2", tmp_path, {}, staging=tmp_path / "staging", staging_base="v1")
@@ -1272,9 +1263,3 @@ def test_in_place_install_replaces_the_reload(staged_checkpoint, monkeypatch):
     assert installer._live_version == "v2"
 
 
-def test_in_place_install_is_opt_in(staged_checkpoint, monkeypatch):
-    monkeypatch.delenv("MX_REFIT_INPLACE", raising=False)
-    installer = _installer()
-
-    assert installer._install_in_place(staged_checkpoint, live_version="v1") is None
-    assert _InPlace.calls == []

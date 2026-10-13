@@ -53,6 +53,8 @@ from .version_chain import resolve_replay_chain
 logger = logging.getLogger("modelexpress_rl.inference.prefetch")
 
 STATUS_FILE = "prefetch.json"
+# How often the prefetcher checks for new versions.
+POLL_SECONDS = 2.0
 TRIGGER_FILE = PREFETCH_TRIGGER_FILE
 LOCK_FILE = ".prefetch.lock"
 
@@ -155,6 +157,7 @@ class RefitPrefetcher:
             model_name=settings.cache_model_name,
             config=settings.object_storage(),
             s3=s3,
+            stage_deltas=settings.staged,
         )
         prefetcher = cls(
             settings,
