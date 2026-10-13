@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+import traceback
 import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
@@ -217,7 +218,8 @@ class StagedRunReader:
 
     With peers, each rank reads an equal share of a run's bytes and an
     all-gather assembles the run, so each staged byte crosses host memory once
-    per peer group rather than once per rank. Peers must read the same runs.
+    per peer group rather than once per rank. Peers must read the same runs,
+    and a rank that stops partway must ``drain`` the rest.
     """
 
     def __init__(
@@ -251,10 +253,12 @@ class StagedRunReader:
         self._reads: dict[int, list[Future]] = {}
         self._submitted = 0
         self._delivered = 0
+        # Runs this rank has gathered with its peers, or that need no gather.
+        self._gathered = 0
         # Time spent waiting for reads, behind the device.
         self.wait_seconds = 0.0
-        for _ in self._buffers:
-            self._submit()
+        for index in range(len(self._buffers)):
+            self._submit(index)
 
     def _share(self, begin: int, end: int) -> _Share:
         rank, size = (self._peers.rank, self._peers.size) if self._peers else (0, 1)
@@ -268,9 +272,9 @@ class StagedRunReader:
         lengths = (positions[1] - positions[0], values[1] - values[0])
         return _Share(mine[0], mine[1], parts[0], parts[1], lengths)
 
-    def _submit(self) -> None:
-        index = self._submitted
-        if index >= len(self._runs):
+    def _submit(self, index: int) -> None:
+        # A slot is refilled once, however the delivery that frees it ends.
+        if index != self._submitted or index >= len(self._runs):
             return
         self._submitted += 1
         slot = index % len(self._buffers)
@@ -300,18 +304,22 @@ class StagedRunReader:
         index = self._delivered
         if index >= len(self._runs):
             raise StopIteration
-        started = time.perf_counter()
-        for read in self._reads.pop(index):
-            read.result()
-        self.wait_seconds += time.perf_counter() - started
         self._delivered += 1
+        started = time.perf_counter()
+        # Every read ends before its slot can be refilled, even when one fails.
+        errors = [read.exception() for read in self._reads.pop(index)]
+        self.wait_seconds += time.perf_counter() - started
+        for error in errors:
+            if error is not None:
+                raise error
         slot = index % len(self._buffers)
         share = self._shares[index]
         width = share.positions_part + share.values_part
         begin, end = self._runs[index]
         if width == 0:
             # Every peer sees the same empty run, so none gathers it.
-            self._submit()
+            self._submit(index + len(self._buffers))
+            self._gathered += 1
             empty = torch.empty(0, dtype=torch.uint8, device=self._device)
             return StagedRun(begin, end, empty.view(torch.int32), empty)
         host = self._buffers[slot][:width]
@@ -323,8 +331,10 @@ class StagedRunReader:
             self._copies[slot] = copy
         else:
             local = host.to(self._device, copy=True)
-        self._submit()
-        rows = (self._peers.all_gather(local) if self._peers else local).view(-1, width)
+        self._submit(index + len(self._buffers))
+        gathered = self._peers.all_gather(local) if self._peers else local
+        self._gathered += 1
+        rows = gathered.view(-1, width)
         positions_bytes, values_bytes = share.run_bytes
         offsets = rows[:, : share.positions_part].reshape(-1)[:positions_bytes]
         values = rows[:, share.positions_part :].reshape(-1)[:values_bytes]
@@ -332,6 +342,28 @@ class StagedRunReader:
             torch.int32 if self._staged.offset_widths(begin, end)[0] == 4 else torch.int64
         )
         return StagedRun(begin, end, offsets, values)
+
+    def drain(self) -> None:
+        """Take part in the gathers of the runs left, discarding the runs.
+
+        A run whose delivery failed before its gather goes out as zeros, so
+        peers gather the same runs in the same order whatever failed here.
+        """
+        if self._peers is None:
+            return
+        while self._gathered < len(self._runs):
+            index = self._gathered
+            if index == self._delivered:
+                with suppress(Exception):
+                    next(self)
+                continue
+            # Its bytes may be partly read, or its slot refilled with a later run's.
+            self._submit(index + len(self._buffers))
+            share = self._shares[index]
+            width = share.positions_part + share.values_part
+            if width:
+                self._peers.all_gather(torch.zeros(width, dtype=torch.uint8, device=self._device))
+            self._gathered += 1
 
     def close(self) -> None:
         self._pool.shutdown(wait=True, cancel_futures=True)
@@ -861,11 +893,12 @@ class InPlaceInstaller:
                             metadata,
                             runs,
                         )
-            except Exception:
-                # Peers gather every run together, so finish reading them first.
+            except Exception as error:
+                # Peers gather every run together, so gather the rest with them
+                # first, without the memory the failed layer still holds.
+                traceback.clear_frames(error.__traceback__)
                 with suppress(Exception):
-                    for _run in reader:
-                        pass
+                    reader.drain()
                 raise
             if targets is not None:
                 found = targets.result()
@@ -942,6 +975,10 @@ class InPlaceInstaller:
                         layouts[index] = self._sparse.layout(layer, shapes)
                     except sparse_experts.SparseExpertError as error:
                         reason = str(error)
+                    except Exception as error:
+                        # Any failure here, such as running out of memory, only
+                        # rules the layer out, so every peer reaches the agreement.
+                        reason = f"{type(error).__name__}: {error}"
                     seconds += time.perf_counter() - started
             if reason is not None:
                 if self._sparse_rejected.get(index) != reason:

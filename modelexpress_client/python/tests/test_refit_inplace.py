@@ -3,7 +3,9 @@
 
 """Staging of nonzero XOR bytes and in-place installation of deltas."""
 
+import copy
 import dataclasses
+import errno
 import functools
 import json
 import threading
@@ -653,23 +655,33 @@ def test_staged_runs_split_by_size_and_offset_width(tmp_path):
 
 
 class _Exchange:
-    """Ranks simulated by threads that all-gather through a barrier."""
+    """Ranks simulated by threads that all-gather through a barrier.
 
-    def __init__(self, size):
+    A rank left waiting for the others fails after ``timeout`` seconds.
+    """
+
+    def __init__(self, size, timeout=10.0):
         self.size = size
-        self._barrier = threading.Barrier(size)
+        self._barrier = threading.Barrier(size, timeout=timeout)
         self._parts = [None] * size
+        # Bytes each rank sent in each of its gathers of staged runs.
+        self.gathered = [[] for _ in range(size)]
 
     def peers(self, rank):
-        def all_gather(tensor):
+        def exchange(tensor):
             self._parts[rank] = tensor
             self._barrier.wait()
             gathered = torch.cat(self._parts)
             self._barrier.wait()
             return gathered
 
+        def all_gather(tensor):
+            gathered = exchange(tensor)
+            self.gathered[rank].append(tensor.numel())
+            return gathered
+
         def agree(flags):
-            return all_gather(flags).view(self.size, -1).amin(0)
+            return exchange(flags).view(self.size, -1).amin(0)
 
         return inplace_module.Peers(rank, self.size, all_gather, agree)
 
@@ -904,31 +916,74 @@ def test_expert_layers_install_from_one_reader(monkeypatch, tmp_path):
     staged.close()
 
 
-def test_a_rank_that_fails_an_expert_layer_still_gathers_every_run(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("layer", inplace_module.InPlaceUnsupported),
+        ("read", OSError),
+        ("gather", torch.OutOfMemoryError),
+    ],
+)
+def test_a_rank_that_fails_partway_still_gathers_every_run(monkeypatch, tmp_path, failure, expected):
     model, checkpoint, staged, _deltas = _expert_layers(monkeypatch, tmp_path)
-    gathered = []
-    peers = inplace_module.Peers(
-        0, 1, lambda tensor: gathered.append(tensor.numel()) or tensor, lambda flags: flags
-    )
-    cpu = torch.device("cpu")
-    inplace_module.InPlaceInstaller(
-        model, device=cpu, generic_reload=lambda load: None, peers=peers
-    )._install(checkpoint, staged)
-    runs, gathered[:] = len(gathered), []
-    installer = inplace_module.InPlaceInstaller(
-        model, device=cpu, generic_reload=lambda load: None, peers=peers
-    )
+    exchange = _Exchange(2)
+    peers = [exchange.peers(rank) for rank in range(2)]
+    stageds = [staged, StagedDelta(tmp_path / "staging")]
+    read_into, gather, calls = stageds[1].read_into, peers[1].all_gather, []
+    # Rank 1 cannot read its share of the values from row 2 on.
+    unreadable = staged.byte_ranges(2, 3)[1][0]
 
-    def fail(_layer, _staged, _names, _metadata, runs):
+    def fail_layer(_layer, _staged, _names, _metadata, runs):
         next(runs)
         raise inplace_module.InPlaceUnsupported("layout differs")
 
-    monkeypatch.setattr(installer, "_install_experts", fail)
-    with pytest.raises(inplace_module.InPlaceUnsupported, match="layout differs"):
-        installer._install(checkpoint, staged)
+    def fail_read(file, offset, out):
+        if file == VALUES_FILE and offset >= unreadable:
+            raise OSError(errno.EIO, "Input/output error")
+        read_into(file, offset, out)
 
-    # Its peers gather each run with it, so it reads every run before it fails.
-    assert runs > 2 and len(gathered) == runs
+    def fail_gather(tensor):
+        # Out of memory before its third gather starts.
+        calls.append(tensor.numel())
+        if len(calls) == 3:
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        return gather(tensor)
+
+    if failure == "read":
+        monkeypatch.setattr(stageds[1], "read_into", fail_read)
+    if failure == "gather":
+        peers[1] = dataclasses.replace(peers[1], all_gather=fail_gather)
+    installers = [
+        inplace_module.InPlaceInstaller(
+            replica, device=torch.device("cpu"), generic_reload=lambda load: None, peers=peer
+        )
+        for replica, peer in zip((model, copy.deepcopy(model)), peers)
+    ]
+    if failure == "layer":
+        monkeypatch.setattr(installers[1], "_install_experts", fail_layer)
+    outcomes = [None, None]
+
+    def install(rank):
+        try:
+            outcomes[rank] = installers[rank]._install(checkpoint, stageds[rank])
+        except Exception as error:
+            outcomes[rank] = error
+
+    threads = [threading.Thread(target=install, args=(rank,), daemon=True) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    # Neither rank is left waiting, and only the failing one raises, with its own error.
+    assert not any(thread.is_alive() for thread in threads)
+    assert isinstance(outcomes[0], dict)
+    assert isinstance(outcomes[1], expected)
+    # The ranks gather every run together, in the same order.
+    runs = inplace_module.staged_runs(staged, 0, 6) + inplace_module.staged_runs(staged, 6, 12)
+    assert len(runs) > 2 and len(exchange.gathered[0]) == len(runs)
+    assert exchange.gathered[1] == exchange.gathered[0]
+    stageds[1].close()
     staged.close()
 
 
