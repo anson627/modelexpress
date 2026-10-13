@@ -403,7 +403,7 @@ class RefitPrefetcher:
     def _speculate(self, head: CheckpointRecord) -> str | None:
         """Prepare the unregistered delta whose snapshot names the head as base."""
         version = self._next_speculative(head)
-        if version is None or (version.version_id, head.version) in self._failed:
+        if version is None:
             return None
         return self._prepare(
             version.version_id,
@@ -416,7 +416,10 @@ class RefitPrefetcher:
         )
 
     def _next_speculative(self, head: CheckpointRecord) -> _S3Version | None:
-        """Return the unregistered delta whose snapshot names the head as base."""
+        """Return the unregistered delta whose snapshot names the head as base.
+
+        None when its preparation from the head already failed.
+        """
         speculation = self._store.speculation()
         if speculation is not None and speculation.get("version") == head.version:
             return None
@@ -438,8 +441,11 @@ class RefitPrefetcher:
             uri = f"{prefix}/{child}/{index_name}"
             if not self._is_complete_child_delta(uri, base_version=head_version):
                 continue
+            version_id = speculative_version_id(uri)
+            if (version_id, head.version) in self._failed:
+                return None
             return _S3Version(
-                version_id=speculative_version_id(uri),
+                version_id=version_id,
                 base_version_id=head.version,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
                 uri=uri,

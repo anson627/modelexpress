@@ -600,6 +600,33 @@ def test_a_rewrite_reports_the_delta_it_prepared(monkeypatch, tmp_path):
     )
 
 
+def test_a_rewrite_does_not_join_a_speculative_delta_that_failed_from_its_head(
+    monkeypatch, tmp_path
+):
+    # One staged delta is the limit, and the rewrite checks S3 at once.
+    monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "1")
+    monkeypatch.setattr(prefetch_module, "POLL_SECONDS", 0.0)
+    objects = {
+        **_delta_snapshot(
+            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+        ),
+        # This delta was computed against other base bytes, so its target check fails.
+        **_delta_snapshot(
+            [5.0, 5.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
+        ),
+    }
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True, staged=True)
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+    assert prefetcher.poll_once() == "v1"
+    checkpoint.store.activate("v1")
+
+    # The speculation fails from v1, so the rewrite of v1 that follows leaves it out.
+    assert prefetcher.poll_once() == "v1"
+    state = checkpoint.store.state()
+    assert (state.status, state.version) == (CheckpointState.READY, "v1")
+    assert _head_weight(checkpoint) == [1.0, 3.0]
+
+
 def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path):
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
