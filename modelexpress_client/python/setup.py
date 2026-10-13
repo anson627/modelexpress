@@ -38,15 +38,7 @@ _OPTIONAL_EXT_ERRORS = (
 
 
 class BuildExtension(build_ext):
-    """Custom build extension that respects $CXX and is best-effort.
-
-    The modelexpress.vmm._alloc_ext C extension is OPTIONAL. If
-    compilation fails for any reason (no compiler installed, header
-    mismatch, sandbox restrictions), this build_ext catches the error
-    and emits a warning instead of aborting the install. The resulting
-    wheel is pure-Python; the runtime detects the missing .so and falls
-    back gracefully.
-    """
+    """Custom build extension that respects $CXX and is best-effort."""
 
     def build_extensions(self):
         cxx = os.environ.get("CXX", "g++")
@@ -58,7 +50,8 @@ class BuildExtension(build_ext):
         try:
             build_ext.build_extensions(self)
         except _OPTIONAL_EXT_ERRORS as e:
-            self._warn_optional_skip(e)
+            for ext in self.extensions:
+                self._warn_optional_skip(e, ext_name=ext.name)
 
     def build_extension(self, ext):
         try:
@@ -67,7 +60,7 @@ class BuildExtension(build_ext):
             self._warn_optional_skip(e, ext_name=ext.name)
 
     @staticmethod
-    def _warn_optional_skip(exc, ext_name="modelexpress.vmm._alloc_ext"):
+    def _warn_optional_skip(exc, ext_name):
         msg = (
             f"Failed to build optional C extension {ext_name}: "
             f"{type(exc).__name__}: {exc}. "
