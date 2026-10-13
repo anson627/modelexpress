@@ -29,6 +29,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from modelexpress.gds_loader import SAFETENSORS_DTYPE_MAP
 
 from modelexpress_rl.inference.engines.vllm import sparse_experts
 from modelexpress_rl.inference.engines.vllm.surgical import checkpoint_module, module_groups
@@ -66,31 +67,10 @@ _BIT_MOVING_FP8_MOE = frozenset({"TRITON", "VLLM_CUTLASS"})
 _SCALE_CLAMPING_FP8_MOE = frozenset({"FLASHINFER_TRTLLM", "FLASHINFER_CUTLASS"})
 # FP8 linear kernels whose processing leaves weights and scales as loaded.
 _BIT_MOVING_FP8_LINEAR = frozenset({"CutlassFp8BlockScaledMMKernel", "TritonFp8BlockScaledMMKernel"})
-_TORCH_DTYPES = {
-    "BF16": torch.bfloat16,
-    "F16": torch.float16,
-    "F32": torch.float32,
-    "F64": torch.float64,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
-    "F8_E4M3": torch.float8_e4m3fn,
-    "F8_E5M2": torch.float8_e5m2,
-}
 
 
 class InPlaceUnsupported(RuntimeError):
     """The delta cannot be installed in place; reload the target instead."""
-
-
-def raw_bytes(tensor: torch.Tensor) -> torch.Tensor:
-    """Return a byte view that shares storage with ``tensor``."""
-    if not tensor.is_contiguous():
-        raise InPlaceUnsupported("live tensor is not contiguous")
-    return tensor.reshape(-1).view(torch.uint8)
 
 
 _SAME_SIZE_INTEGER = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
@@ -104,17 +84,15 @@ def bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(integer)
 
 
-def same_bits(left: torch.Tensor, right: torch.Tensor) -> bool:
-    return left.shape == right.shape and torch.equal(bits(left), bits(right))
-
-
 def xor_into(target: torch.Tensor, value: torch.Tensor) -> None:
     """XOR the bits of ``value`` into ``target`` in place."""
     if target.shape == value.shape and target.element_size() == value.element_size():
         bits(target).bitwise_xor_(bits(value))
         return
     # Processing may change the shape of a tensor but not its storage size.
-    target_bytes = raw_bytes(target)
+    if not target.is_contiguous():
+        raise InPlaceUnsupported("live tensor is not contiguous")
+    target_bytes = target.reshape(-1).view(torch.uint8)
     value_bytes = value.contiguous().reshape(-1).view(torch.uint8)
     if target_bytes.numel() != value_bytes.numel():
         raise InPlaceUnsupported("processed tensor size differs from live storage")
@@ -130,10 +108,6 @@ def layer_key(name: str) -> int | None:
     """Decoder layer index of a dotted tensor or module name, if any."""
     match = _LAYER.search(f".{name}.")
     return int(match[1]) if match else None
-
-
-def is_per_expert(name: str) -> bool:
-    return _PER_EXPERT.search(name) is not None
 
 
 @contextmanager
@@ -180,6 +154,9 @@ class Peers:
     size: int
     # Concatenates every peer's equally sized tensor along dimension 0, in rank order.
     all_gather: Callable[[torch.Tensor], torch.Tensor]
+    # Reduces flags to those every peer set, so peers that gather staged bytes
+    # together take the same path.
+    agree: Callable[[torch.Tensor], torch.Tensor]
 
 
 # Staged bytes per run that ranks read and gather, and per pass that places them.
@@ -351,10 +328,9 @@ class StagedRunReader:
         positions_bytes, values_bytes = share.run_bytes
         offsets = rows[:, : share.positions_part].reshape(-1)[:positions_bytes]
         values = rows[:, share.positions_part :].reshape(-1)[:values_bytes]
-        if self._staged.offset_widths(begin, end)[0] == 4:
-            offsets = offsets.view(torch.int32)
-        else:
-            offsets = offsets.view(torch.int64)
+        offsets = offsets.view(
+            torch.int32 if self._staged.offset_widths(begin, end)[0] == 4 else torch.int64
+        )
         return StagedRun(begin, end, offsets, values)
 
     def close(self) -> None:
@@ -497,7 +473,7 @@ def arrange_expert_delta(
     transposed = bool(getattr(meta[first], "is_transposed", False))
     experts = meta[first].shape[0]
     # Every projection of every kind gets one slot of ``flat``, one shard per expert.
-    slots: dict[tuple[str, str], tuple[int, tuple[int, int], torch.dtype]] = {}
+    slots: dict[tuple[str, str], tuple[int, int, tuple[int, int], torch.dtype]] = {}
     rules: dict[int, tuple[int, int, int, int]] = {}
     size = 0
     for kind in params:
@@ -506,8 +482,8 @@ def arrange_expert_delta(
             if sample is None or len(metadata[sample]["shape"]) != 2:
                 raise InPlaceUnsupported(f"expert {proj} {kind} is not a 2-D tensor")
             rows, cols = metadata[sample]["shape"]
-            dtype = _TORCH_DTYPES[metadata[sample]["dtype"]]
-            itemsize = torch.empty((), dtype=dtype).element_size()
+            dtype = SAFETENSORS_DTYPE_MAP[metadata[sample]["dtype"]]
+            itemsize = dtype.itemsize
             if proj != "down":
                 shard = (rows // tp_size, cols)
                 shard_bytes = shard[0] * cols * itemsize
@@ -519,7 +495,7 @@ def arrange_expert_delta(
                 shard_bytes = rows * width
                 rule = (cols * itemsize, width, tp_rank * width)
             size = -(-size // 256) * 256
-            slots[(kind, proj)] = (size, shard, dtype)
+            slots[(kind, proj)] = (size, experts * shard_bytes, shard, dtype)
             for expert in range(experts):
                 name = expert_names.get((expert, proj, kind))
                 if name in staged:
@@ -543,8 +519,7 @@ def arrange_expert_delta(
     for kind, (w13_name, w2_name) in params.items():
         parts = {}
         for proj in ("gate", "up", "down"):
-            base, shard, dtype = slots[(kind, proj)]
-            nbytes = experts * shard[0] * shard[1] * torch.empty((), dtype=dtype).element_size()
+            base, nbytes, shard, dtype = slots[(kind, proj)]
             tensor = flat[base : base + nbytes].view(dtype).view(experts, *shard)
             parts[proj] = tensor.transpose(1, 2) if transposed else tensor
         w13 = torch.cat([parts["gate"], parts["up"]], dim=2 if transposed else 1).contiguous()
@@ -710,7 +685,7 @@ class CheckpointCatalog:
         per_expert, unmatched, generic = set(), set(), []
         for name in metadata:
             layers[name] = layer_key(name)
-            if not is_per_expert(name):
+            if _PER_EXPERT.search(name) is None:
                 generic.append(name)
                 continue
             per_expert.add(name)
@@ -732,7 +707,6 @@ class InPlaceInstaller:
         *,
         device: torch.device,
         generic_reload: Callable[[Callable[[Any], None]], None],
-        agree: Callable[[torch.Tensor], torch.Tensor] | None = None,
         peers: Peers | None = None,
     ) -> None:
         self._model = model
@@ -740,12 +714,10 @@ class InPlaceInstaller:
         self._generic_reload = generic_reload
         # Ranks that split reading staged expert bytes.
         self._peers = peers
-        # Reduces flags to those every tensor-parallel peer set, so peers that
-        # gather staged bytes together take the same path.
-        self._agree = agree
         self._experts = routed_expert_layers(model)
-        # Layers this rank does not serve: other pipeline stages' placeholders,
-        # and checkpoint layers the model never builds, such as unused MTP layers.
+        self._expert_ids = {id(module) for module in self._experts.values()}
+        # Layers this rank serves, without other pipeline stages' placeholders or
+        # checkpoint layers the model never builds, such as unused MTP layers.
         self._served_layers = {
             key
             for path, module in model.named_modules()
@@ -754,14 +726,14 @@ class InPlaceInstaller:
         # Processed zeros per expert layout; None when processing maps zero to zero.
         self._zero_terms: dict[tuple, dict[str, torch.Tensor] | None] = {}
         self._catalog: tuple[dict[str, dict], CheckpointCatalog] | None = None
-        # Time spent building the reload's inputs in the current install.
-        self._input_seconds = 0.0
         self._sparse = sparse_experts.SparseExperts(device)
         # Expert layers sparse writes cannot install, with the reason last logged.
         self._sparse_rejected: dict[int, str] = {}
         # Per checkpoint layout: whether each generic tensor's module needs its values.
         self._needs_values: tuple[dict[str, dict], dict[str, bool]] | None = None
-        self._packed: dict[str, list[str]] | None = None
+        self._packed: dict[str, list[str]] = {}
+        for module in model.modules():
+            self._packed.update(getattr(module, "packed_modules_mapping", None) or {})
 
     def install(
         self,
@@ -833,10 +805,8 @@ class InPlaceInstaller:
         values = self._value_tensors(changed, catalog, metadata)
         if values and reload_values is None:
             raise InPlaceUnsupported(f"processing changes the values of {sorted(values)[:3]}")
-        self._sparse.layout_seconds = 0.0
-        layouts = self._agreed_layouts(
-            expert_layers, self._sparse_layouts(expert_layers, staged, catalog, metadata)
-        )
+        layouts, layout_seconds = self._sparse_layouts(expert_layers, catalog, metadata)
+        layouts = self._agreed_layouts(expert_layers, layouts)
         for index in expert_layers:
             if index not in layouts:
                 kinds = {
@@ -914,8 +884,7 @@ class InPlaceInstaller:
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
-        self._input_seconds = 0.0
-        fed = self._install_generic(
+        fed, input_seconds = self._install_generic(
             staged,
             [name for name in changed if name not in values],
             catalog,
@@ -939,9 +908,9 @@ class InPlaceInstaller:
             "perf/mx_receive_inplace_sparse_expert_layers": float(len(layouts)),
             "perf/mx_receive_inplace_sparse_expert_bytes": float(sparse_bytes),
             "perf/mx_receive_inplace_sparse_scale_tensors": float(scale_tensors),
-            "perf/mx_receive_inplace_sparse_layout_time": self._sparse.layout_seconds,
+            "perf/mx_receive_inplace_sparse_layout_time": layout_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
-            "perf/mx_receive_inplace_input_time": self._input_seconds,
+            "perf/mx_receive_inplace_input_time": input_seconds,
             "perf/mx_receive_inplace_generic_time": generic_seconds,
             "perf/mx_receive_inplace_value_tensors": float(len(values)),
             "perf/mx_receive_inplace_value_time": time.perf_counter() - value_started,
@@ -950,36 +919,37 @@ class InPlaceInstaller:
     def _sparse_layouts(
         self,
         expert_layers: list[int],
-        staged: StagedDelta,
         catalog: CheckpointCatalog,
         metadata: dict[str, dict],
-    ) -> dict[int, sparse_experts.ExpertLayout]:
-        """Layouts of the expert layers sparse writes install; the rest take the arranged path."""
+    ) -> tuple[dict[int, sparse_experts.ExpertLayout], float]:
+        """Layouts of the expert layers sparse writes install, and the seconds spent deriving them.
+
+        The other expert layers take the arranged path.
+        """
         layouts: dict[int, sparse_experts.ExpertLayout] = {}
         rejected: dict[str, list[int]] = defaultdict(list)
+        seconds = 0.0
         for index in expert_layers:
             layer = self._experts[index]
             reason = sparse_experts.ineligible(layer)
-            shapes = None
             if reason is None:
                 shapes = _expert_shapes(catalog.experts.get(index, {}), metadata)
                 if shapes is None:
                     reason = "the checkpoint lacks an FP32-scaled weight of every projection"
-            if reason is None:
-                assert shapes is not None
-                started = time.perf_counter()
-                try:
-                    layouts[index] = self._sparse.layout(layer, shapes)
-                except sparse_experts.SparseExpertError as error:
-                    reason = str(error)
-                self._sparse.layout_seconds += time.perf_counter() - started
+                else:
+                    started = time.perf_counter()
+                    try:
+                        layouts[index] = self._sparse.layout(layer, shapes)
+                    except sparse_experts.SparseExpertError as error:
+                        reason = str(error)
+                    seconds += time.perf_counter() - started
             if reason is not None:
                 if self._sparse_rejected.get(index) != reason:
                     rejected[reason].append(index)
                 self._sparse_rejected[index] = reason
         for reason, indices in rejected.items():
             logger.info("Sparse expert writes skip %d layers, e.g. %s: %s", len(indices), indices[:3], reason)
-        return layouts
+        return layouts, seconds
 
     def _install_sparse(
         self,
@@ -1028,16 +998,15 @@ class InPlaceInstaller:
         if self._needs_values is None or self._needs_values[0] is not metadata:
             self._needs_values = (metadata, {})
         known = self._needs_values[1]
-        packed = self._packed_modules()
         needed = []
         for name in changed:
             if name in catalog.per_expert:
                 continue
             if name not in known:
-                known[name] = self._needs_value(name, metadata, packed)
+                known[name] = self._needs_value(name, metadata, self._packed)
             if known[name]:
                 needed.append(name)
-        return module_groups(needed, catalog.generic, packed) if needed else set()
+        return module_groups(needed, catalog.generic, self._packed) if needed else set()
 
     def _needs_value(
         self, name: str, metadata: dict[str, dict], packed: dict[str, list[str]]
@@ -1052,13 +1021,6 @@ class InPlaceInstaller:
             # An FP8 tensor whose module is unknown may not install bit for bit.
             return metadata[name]["dtype"].startswith("F8") or name.endswith("weight_scale_inv")
         return not moves_bits(module)
-
-    def _packed_modules(self) -> dict[str, list[str]]:
-        if self._packed is None:
-            self._packed = {}
-            for module in self._model.modules():
-                self._packed.update(getattr(module, "packed_modules_mapping", None) or {})
-        return self._packed
 
     def _catalog_for(self, metadata: dict[str, dict]) -> CheckpointCatalog:
         # The checkpoint index returns the same metadata while headers are unchanged.
@@ -1105,33 +1067,30 @@ class InPlaceInstaller:
         catalog: CheckpointCatalog,
         metadata: dict[str, dict],
         *,
-        excluded: set[str] = frozenset(),
-    ) -> int:
+        excluded: set[str],
+    ) -> tuple[int, float]:
         """Reload every tensor of each changed non-expert group with XOR restore.
 
-        The reload feeds none of the ``excluded`` tensors. Returns how many it fed.
+        The reload feeds none of the ``excluded`` tensors. Returns how many it
+        fed and the seconds spent building their inputs.
         """
         groups = {catalog.layers[name] for name in changed if name not in catalog.per_expert}
         fed = [
             name
             for name in catalog.generic
-            if catalog.layers[name] in groups
-            and self._served(catalog.layers[name])
-            and name not in excluded
+            if catalog.layers[name] in groups and name not in excluded
         ]
         if not fed:
-            return 0
-        unknown = sorted({metadata[name]["dtype"] for name in fed} - _TORCH_DTYPES.keys())
+            return 0, 0.0
+        unknown = sorted({metadata[name]["dtype"] for name in fed} - SAFETENSORS_DTYPE_MAP.keys())
         if unknown:
             raise InPlaceUnsupported(f"unsupported checkpoint dtypes {unknown}")
         staged_names = set(changed)
+        live = self._live_tensors(groups)
         # Some loaders write live storage directly: tensors reload leaves in place,
         # such as biases, and mirrors a loader keeps, such as fp32 decode copies.
         # They then hold the loaded value rather than an XOR of it.
-        originals = {
-            name: tensor.detach().clone()
-            for name, tensor in self._live_tensors(groups).items()
-        }
+        originals = {name: tensor.detach().clone() for name, tensor in live.items()}
 
         device = self._input_device(max(metadata[name]["byte_size"] for name in fed))
         input_seconds = 0.0
@@ -1144,23 +1103,22 @@ class InPlaceInstaller:
                 delta = None if zero or name not in staged_names else staged.tensor(name)
                 data = staged_bytes(info["byte_size"], delta, device)
                 input_seconds += time.perf_counter() - started
-                yield name, data.view(_TORCH_DTYPES[info["dtype"]]).view(info["shape"])
+                yield name, data.view(SAFETENSORS_DTYPE_MAP[info["dtype"]]).view(info["shape"])
 
-        live = self._live_tensors(groups)
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
         # XOR the original back into every tensor the zero pass changed, after
         # both passes. A tensor a loader overwrote then ends as original ^ delta;
         # for one the XOR restore changed, the two extra XORs cancel.
         changed_live = {}
         for name, original in originals.items():
-            if not same_bits(live[name].data, original):
-                xor_into(live[name].data, original)
+            current = live[name].data
+            if not (current.shape == original.shape and torch.equal(bits(current), bits(original))):
+                xor_into(current, original)
                 changed_live[name] = original
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=False)))
         for name, original in changed_live.items():
             xor_into(live[name].data, original)
-        self._input_seconds = input_seconds
-        return len(fed)
+        return len(fed), input_seconds
 
     def _agreed_layouts(
         self, expert_layers: list[int], layouts: dict[int, sparse_experts.ExpertLayout]
@@ -1170,17 +1128,17 @@ class InPlaceInstaller:
         A layer that one peer cannot write sparsely may make it refuse the
         install, which its peers must then refuse before they gather staged runs.
         """
-        if self._agree is None or not expert_layers:
+        if self._peers is None or not expert_layers:
             return layouts
         flags = torch.tensor([index in layouts for index in expert_layers], dtype=torch.int32)
-        agreed = self._agree(flags).tolist()
+        agreed = self._peers.agree(flags).tolist()
         return {index: layouts[index] for index, flag in zip(expert_layers, agreed) if flag}
 
     def _input_device(self, nbytes: int) -> torch.device:
         """Build reload inputs on the GPU when it has room for a few of the largest.
 
         Host inputs cost page faults and a host-to-device copy of every byte.
-        Asked once per reload, since querying free memory can be slow.
+        Asked once for both reloads of an install, since querying free memory can be slow.
         """
         if self._device.type != "cuda":
             return torch.device("cpu")
@@ -1192,12 +1150,13 @@ class InPlaceInstaller:
 
     def _live_tensors(self, groups: set[int | None]) -> dict[str, torch.Tensor]:
         """Parameters and buffers of the changed groups, except routed experts."""
-        experts = {id(module) for module in self._experts.values()}
         found: dict[str, torch.Tensor] = {}
         for path, module in self._model.named_modules():
-            if id(module) in experts or layer_key(path) not in groups:
-                continue
-            if any(part == "experts" for part in path.split(".")):
+            if (
+                layer_key(path) not in groups
+                or id(module) in self._expert_ids
+                or "experts" in path.split(".")
+            ):
                 continue
             for name, tensor in list(module.named_parameters(recurse=False)) + list(
                 module.named_buffers(recurse=False)
@@ -1245,14 +1204,11 @@ __all__ = [
     "InPlaceUnsupported",
     "Peers",
     "StagedPlacement",
-    "StagedRun",
     "StagedRunReader",
     "arrange_expert_delta",
     "bits",
-    "expert_rows",
+    "fp8_moe_unsupported",
     "process_like_weights",
-    "raw_bytes",
-    "routed_expert_layers",
     "staged_bytes",
     "staged_runs",
     "xor_into",

@@ -181,7 +181,7 @@ def derive_layout(
             recovered = run(proj, kind, codes.to(torch.float32))[target].reshape(-1).to(torch.int64)
         else:
             dtype = live[target].dtype
-            size = torch.empty((), dtype=dtype).element_size()
+            size = dtype.itemsize
             bits = 8 * size
             recovered = torch.zeros(live[target][0].numel(), dtype=torch.int64, device=device)
             for shift in range(0, _CODE_BITS, bits):
@@ -219,7 +219,7 @@ def _expert_temps(
     gate_scale, down_scale = shapes[("gate", SCALE)], shapes[("down", SCALE)]
 
     def zeros(rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
-        size = torch.empty((), dtype=dtype).element_size()
+        size = dtype.itemsize
         return torch.zeros((1, rows, cols * size), dtype=torch.uint8, device=device).view(dtype)
 
     return [
@@ -236,8 +236,6 @@ class SparseExperts:
     def __init__(self, device: torch.device) -> None:
         self._device = device
         self._layouts: dict[tuple, ExpertLayout] = {}
-        # Time spent deriving layouts in the current install.
-        self.layout_seconds = 0.0
 
     def layout(
         self, module: torch.nn.Module, shapes: Mapping[tuple[str, str], tuple[int, ...]]
@@ -353,5 +351,4 @@ __all__ = [
     "derive_layout",
     "ineligible",
     "live_tensors",
-    "scale_copies",
 ]

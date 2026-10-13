@@ -596,23 +596,6 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
             layer.register_buffer(name, buffer)
 
 
-def _agree_with_peers(flags: torch.Tensor) -> torch.Tensor:
-    """Keep the flags that every tensor-parallel rank of this pipeline stage set."""
-    try:
-        from vllm.distributed.parallel_state import get_tp_group
-
-        group = get_tp_group()
-    except (ImportError, AssertionError):
-        return flags
-    if group.world_size == 1:
-        return flags
-    agreed = flags.clone()
-    torch.distributed.all_reduce(
-        agreed, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-    )
-    return agreed
-
-
 # vLLM's DeepSeek-V3.2 and GLM loaders buffer an FP8 indexer wk and its scale
 # here until both arrive. The buffer outlives load_weights, so a stale entry
 # would pair with the wrong tensor.
@@ -638,9 +621,6 @@ def _with_staged_deltas(
     tensors: Iterable[tuple[str, torch.Tensor]], overlay: Sequence[Path]
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Checkpoint tensors from files of an earlier version, with the staged deltas since XORed in."""
-    if not overlay:
-        yield from tensors
-        return
     layers: list[StagedDelta] = []
     try:
         for staging in overlay:
@@ -651,10 +631,9 @@ def _with_staged_deltas(
                 tensor = tensor.clone()
                 data = tensor.reshape(-1).view(torch.uint8)
                 for delta in deltas:
-                    if delta.values.size:
-                        positions = torch.from_numpy(delta.positions.astype(np.int64))
-                        values = torch.from_numpy(np.array(delta.values))
-                        data[positions.to(data.device)] ^= values.to(data.device)
+                    positions = torch.from_numpy(delta.positions.astype(np.int64))
+                    values = torch.from_numpy(np.array(delta.values))
+                    data[positions.to(data.device)] ^= values.to(data.device)
             yield name, tensor
     finally:
         for layer in layers:
@@ -671,10 +650,19 @@ def _tensor_parallel_peers() -> Peers | None:
         return None
     if group.world_size == 1:
         return None
+
+    def agree(flags: torch.Tensor) -> torch.Tensor:
+        agreed = flags.clone()
+        torch.distributed.all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        return agreed
+
     return Peers(
         group.rank_in_group,
         group.world_size,
         lambda tensor: group.all_gather(tensor, dim=0),
+        agree,
     )
 
 
@@ -810,25 +798,26 @@ class _VllmInstaller(EngineInstaller):
                 metrics.update(checkpoint.streaming.cache_metrics)
             else:
                 inplace = self._install_in_place(checkpoint, live_version=live_version)
-                changed = (
-                    changed_since(
-                        checkpoint.delta_changes,
-                        live_version=live_version,
-                        target_version=checkpoint.target_version,
+                if inplace is None:
+                    changed = (
+                        changed_since(
+                            checkpoint.delta_changes,
+                            live_version=live_version,
+                            target_version=checkpoint.target_version,
+                        )
+                        if rl_envs.MX_REFIT_DELTA_SURGICAL
+                        else None
                     )
-                    if rl_envs.MX_REFIT_DELTA_SURGICAL and inplace is None
-                    else None
-                )
-                # A STAGED checkpoint's files still hold an earlier version.
-                overlay = checkpoint.overlay
-                if inplace is not None:
-                    metrics.update(inplace)
-                elif changed is None:
-                    self.install_checkpoint(checkpoint.path, overlay=overlay)
+                    # A STAGED checkpoint's files still hold an earlier version.
+                    overlay = checkpoint.overlay
+                    if changed is None:
+                        self.install_checkpoint(checkpoint.path, overlay=overlay)
+                    else:
+                        metrics.update(
+                            self.install_changed_tensors(checkpoint.path, changed, overlay=overlay)
+                        )
                 else:
-                    metrics.update(
-                        self.install_changed_tensors(checkpoint.path, changed, overlay=overlay)
-                    )
+                    metrics.update(inplace)
             self._live_version = checkpoint.target_version
         else:
             raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
@@ -1240,7 +1229,6 @@ class _VllmInstaller(EngineInstaller):
                 self._model,
                 device=self._device,
                 generic_reload=lambda load: self._reload(load, xor=True),
-                agree=_agree_with_peers,
                 peers=_tensor_parallel_peers(),
             )
         try:
@@ -1248,14 +1236,13 @@ class _VllmInstaller(EngineInstaller):
                 checkpoint.path,
                 checkpoint.staging,
                 overlay=checkpoint.overlay,
-                # Modules whose processing changes values reload from the target.
                 reload_values=lambda names: self.install_changed_tensors(
                     checkpoint.path, frozenset(names), overlay=checkpoint.overlay
                 ),
             )
         except InPlaceUnsupported as error:
             # Anything already XORed belongs to a changed module, which the
-            # reload below rewrites from the prepared checkpoint.
+            # caller's reload rewrites from the prepared checkpoint.
             logger.warning("In-place install unavailable, reloading instead: %s", error)
             return None
         logger.info(
