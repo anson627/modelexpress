@@ -1158,11 +1158,12 @@ Full checkpoints are grouped into concurrently uploaded safetensors objects of
 up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
 A single tensor larger than the configured size is uploaded on its own.
 Generators download those objects concurrently through the ModelExpress S3
-client. Each download worker validates one batch and overwrites the matching
-regions in the existing local checkpoint mmaps.
-The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
-only after success. An interrupted update remains unavailable until a fresh
-initialization reseeds it from `seed_checkpoint_path`.
+client. Each download worker validates one batch and writes it into a new full
+checkpoint, which replaces nothing until every batch is in place.
+The receiver marks its local checkpoint `UPDATING` before it changes checkpoint
+files and `READY` only after success. An interrupted update stays `UPDATING`
+until the refit session or the next initialization restores the initial full
+checkpoint.
 
 To keep download and reconstruction out of the serving pause, set
 `MX_REFIT_PREFETCH=true` on generators. A background process per host cache
@@ -1185,10 +1186,11 @@ the client was built with it; installs from source need a C++ compiler and the
 zstd development files for that, and `MX_REFIT_NATIVE_CHECK=false` checks in
 Python instead. See
 [Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
-For block-FP8 models on Blackwell, routed experts under vLLM's default
-FlashInfer TRT-LLM MoE backend take sparse writes, while FP8 linear layers under
-its default DeepGEMM kernel reload from target values during the update;
-serving with `--linear-backend cutlass` keeps them on the faster XOR path.
+For block-FP8 models on Blackwell, routed experts under the FlashInfer TRT-LLM
+MoE backend take sparse writes, while FP8 linear layers under the DeepGEMM
+kernel, both vLLM's defaults there in the versions tested, reload from target
+values during the update; serving with `--linear-backend cutlass` keeps them on
+the faster XOR path.
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
