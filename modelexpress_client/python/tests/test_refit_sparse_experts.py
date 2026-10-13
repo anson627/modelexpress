@@ -261,20 +261,41 @@ def test_arranged_installs_refuse_fp8_processing_that_changes_values(backend, sc
     assert (reason is not None) == unsupported
 
 
-def test_layers_sparse_writes_cannot_take_go_to_the_guarded_arranged_path(fake_oracle, tmp_path, caplog):
+@pytest.mark.parametrize(
+    ("cause", "reason"),
+    [("padded", "tensor-parallel shards are padded"), ("derivation", "OutOfMemoryError: CUDA out of memory")],
+    ids=["padded", "derivation"],
+)
+def test_layers_sparse_writes_cannot_take_go_to_the_guarded_arranged_path(
+    fake_oracle, monkeypatch, tmp_path, caplog, cause, reason
+):
     base = _checkpoint_tensors(11)
     target = _target(base, {f"{PREFIX}.0.gate_proj.weight_scale_inv": lambda t: t.mul_(2)})
     model = _model(base)
-    model.model.layers[0].mlp.experts.moe_config.tp_shard_with_padding = True
+
+    def out_of_memory(*_args):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    if cause == "padded":
+        model.model.layers[0].mlp.experts.moe_config.tp_shard_with_padding = True
+    else:
+        # A layout that fails to derive for any reason only rules the layer out.
+        monkeypatch.setattr(sparse_experts, "derive_layout", out_of_memory)
     staging = _stage(tmp_path / "staging", base, target)
+    agreed = []
+    peers = inplace_module.Peers(
+        0, 1, lambda tensor: tensor, lambda flags: agreed.append(flags.tolist()) or flags
+    )
     installer = inplace_module.InPlaceInstaller(
-        model, device=torch.device("cpu"), generic_reload=lambda load: None
+        model, device=torch.device("cpu"), generic_reload=lambda load: None, peers=peers
     )
 
     with caplog.at_level(logging.INFO), pytest.raises(inplace_module.InPlaceUnsupported, match="changes values"):
         installer.install(_save(tmp_path / "checkpoint", target), staging)
 
-    assert "tensor-parallel shards are padded" in caplog.text
+    assert reason in caplog.text
+    # The rank still joins its peers in agreeing on the sparse layers.
+    assert agreed == [[0]]
     _assert_live(model, base)
 
 
