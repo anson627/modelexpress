@@ -116,7 +116,7 @@ def launch_prefetcher(settings: PrefetchSettings, *, workers: int) -> subprocess
 
 
 class RefitPrefetcher:
-    """Advance the host checkpoint cache to the newest version it can reach."""
+    """Prepare the next version toward the newest registered one in the host checkpoint cache."""
 
     def __init__(
         self,
@@ -278,7 +278,7 @@ class RefitPrefetcher:
                 if current != trigger:
                     trigger = current
                     break
-                time.sleep(min(0.2, POLL_SECONDS))
+                time.sleep(0.2)
 
     def _parent_alive(self) -> bool:
         return os.getppid() == self._settings.parent_pid

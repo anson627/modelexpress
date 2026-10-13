@@ -711,7 +711,8 @@ sequenceDiagram
 - A preparation that fails is not retried from the same cache head. The engine
   prepares that version itself if it is asked for it, and reports the error.
 - With `MX_REFIT_FULL_STREAMING=true`, the prefetcher leaves full checkpoints to
-  the engine, which streams them as it installs them.
+  the engine. The engine streams those without declared checksums as it installs
+  them, and downloads checksummed ones during the update.
 - With `MX_REFIT_PREFETCH_S3_WATCH=true`, it also lists the snapshot prefix of
   the cache head (`<prefix>/<identity>/model.safetensors.index.json`) for
   identities that sort after the head's. It prepares a delta whose index
@@ -719,8 +720,9 @@ sequenceDiagram
   the head index records no version) once every shard exists, before the
   version is registered. When the matching
   version registers, the cache adopts the result by renaming it. If another
-  version is requested instead, the speculative delta is applied again to
-  restore its base exactly, since an XOR delta is its own inverse.
+  version is requested instead, the speculation is undone: a delta written into
+  derived files is applied again, since an XOR delta is its own inverse, and a
+  staged one is dropped.
 - Speculation is one delta deep; full checkpoints are prepared only after
   registration.
 - Engine ranks release the cache between preparing a target and installing it,
@@ -858,7 +860,8 @@ stateDiagram-v2
   bytes in memory, so a small delta stays fast after a dense one. A delta that
   fails its checksums leaves the head unchanged.
 - The pass runs in a C++ extension when the client was built with it, on
-  `MX_REFIT_DELTA_WORKERS` threads without the GIL. Where the head's checksum of
+  `MX_REFIT_DELTA_WORKERS` threads without the GIL (`MX_REFIT_PREFETCH_WORKERS`
+  in the prefetcher). Where the head's checksum of
   a tensor is known, it reads the tensor only at the bytes the delta changes:
   Adler-32 is linear in the bytes, so the old and new bytes there turn the head's
   checksum into the target's. It reads in full the other tensors and a tensor
@@ -884,8 +887,8 @@ stateDiagram-v2
   prefetcher starts writes the staged deltas in its own pass the same way.
 - Writing staged deltas sooner would not pay. At typical densities they change
   nearly every block of the files, so writing them costs about as much as
-  copying the checkpoint, and deltas that arrive faster than that would
-  interrupt it.
+  copying the checkpoint, and with a delta a minute the next delta arrives
+  before such a rewrite ends.
 - The engine installs a `STAGED` target from its own staged delta. Where it must
   reload instead, it reads the files with every staged delta since XORed in, so
   the reload sees the target's bytes.
@@ -901,7 +904,8 @@ stateDiagram-v2
 - `perf/mx_receive_delta_apply` is the time of the checking pass,
   `perf/mx_receive_staged_layers` the number of deltas staged after it, and
   `perf/mx_receive_delta_rewrite` the time spent writing staged deltas into the
-  files, by the prefetcher or before a following delta joined the pass.
+  files, by the prefetcher or before a following delta joined the pass. A delta
+  prepared at the limit counts its whole pass as apply time.
   `perf/mx_receive_delta_sparse_checks` counts the tensors checked at their
   changed bytes, and `perf/mx_receive_delta_sparse_fallbacks` those whose sparse
   check missed and were read in full.

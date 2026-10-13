@@ -849,7 +849,7 @@ class _LocalCheckpoint:
 
         With ``staged``, the result may be STAGED, with files that still hold
         its base. ``announce`` records the target while this waits to prepare,
-        so a prefetcher rewriting the cache head can switch to it.
+        so a prefetcher rewriting the cache head can join it.
         """
         if not versions:
             raise ValueError("canonical replay chain is empty")
@@ -973,7 +973,8 @@ class _LocalCheckpoint:
         """Adopt a matching speculative cache head, or undo one that is not wanted.
 
         Callers hold the exclusive installation and cache locks. A crash while the
-        head changes leaves UPDATING, which initialization rebuilds from lineage.
+        head changes leaves UPDATING, from which initialization restores the
+        initial checkpoint.
         """
         speculation = self.store.speculation()
         if speculation is None:
@@ -1306,7 +1307,7 @@ class _LocalCheckpoint:
             state = self.store.state()
             assert state is not None
         # READY or STAGED -> UPDATING is persisted before any derived checkpoint
-        # mutates. A crash therefore makes the next initializer rebuild from lineage.
+        # mutates, so after a crash initialization restores the initial checkpoint.
         self.store.write_state(
             status=CheckpointState.UPDATING,
             version=active_version,
@@ -1838,8 +1839,9 @@ class _LocalCheckpoint:
             staged_next = (manifest[0], sink, checked)
 
         if reuse_materialized:
-            # STAGED -> UPDATING before the files change, so a crash rebuilds from
-            # lineage. A copy leaves them, and the head STAGED on them, unchanged.
+            # STAGED -> UPDATING before the files change, so after a crash
+            # initialization restores the initial checkpoint. A copy leaves them,
+            # and the head STAGED on them, unchanged.
             self.store.write_state(
                 status=CheckpointState.UPDATING,
                 version=state.version,
@@ -2024,9 +2026,9 @@ class _LocalCheckpoint:
         ``index_metadata`` is the index of the delta that tensors write or check,
         unneeded when they only scatter staged bytes. ``stop`` is asked before
         each tensor starts; once it returns True, the tensors already started
-        finish and the rest are left as they are. ``stats`` receives how many
-        checks read only changed bytes and how many of those missed and read
-        every byte.
+        finish and the rest are left as they are. ``stats`` counts the checks
+        that read only changed bytes, and those that missed there and read every
+        byte instead.
         """
         if stats is not None:
             stats.setdefault("sparse_checks", 0)
@@ -2221,8 +2223,8 @@ class _LocalCheckpoint:
         It takes the deltas a pass only checks, of tensors up to 4 GiB, on
         MX_REFIT_DELTA_WORKERS threads without the GIL, and reads a tensor only
         where its delta changes it when the tensor's base checksum is known. A
-        delta it cannot decompress to its tensor's size is left to Python, which
-        reports it.
+        tensor it cannot check, such as one whose delta does not decompress to its
+        size, is left to Python, which reports it.
         """
         if _delta_ext is None:
             _warn_without_native_check()
@@ -2272,7 +2274,7 @@ class _LocalCheckpoint:
             else:
                 if code == _NATIVE_FALLBACK:
                     logger.warning(
-                        "Sparse check of %s missed its checksum; reading it in full", tensor.name
+                        "Sparse check of %s missed its checksum; read it in full", tensor.name
                     )
                 if stats is not None and code != _NATIVE_FULL:
                     key = "sparse_checks" if code == _NATIVE_SPARSE else "sparse_fallbacks"
