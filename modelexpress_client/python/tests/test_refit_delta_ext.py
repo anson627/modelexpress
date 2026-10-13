@@ -3,18 +3,20 @@
 
 """The C++ delta checker against the Python check pass."""
 
-import zlib
-
 import numpy as np
 import pytest
 
 from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.staging import StagedDelta, join_nonzero, nonzero_bytes, write_staging
 from modelexpress_rl.utils import compress_delta
-
-pytestmark = pytest.mark.skipif(
-    receiver_module._delta_ext is None, reason="built without the C++ delta checker"
+from tests.refit_fixtures import (
+    _check_passes,
+    _checksum,
+    _needs_native_check,
+    _sparse_bytes,
+    _staged_scene,
 )
+
+pytestmark = _needs_native_check
 
 META = {"compression_format": "zstd", "checksum_format": "adler32"}
 # Around the checker's 1 MiB chunks, and tensors of one byte or none.
@@ -29,57 +31,15 @@ SIZES = {
 }
 
 
-def _checksum(data):
-    return f"{zlib.adler32(data):08x}"
-
-
-def _sparse(rng, size, density):
-    return np.where(rng.random(size) < density, rng.integers(1, 256, size), 0).astype(np.uint8)
-
-
 @pytest.fixture
 def scene(tmp_path):
     """Checkpoint files, two deltas staged on them, and the delta under check."""
     rng = np.random.default_rng(9)
-    path = tmp_path / "model.bin"
-    files = rng.integers(0, 256, sum(SIZES.values()), dtype=np.uint8)
-    files.tofile(path)
-    locations, offset = {}, 0
-    for name, size in SIZES.items():
-        locations[name] = (path, offset, size)
-        offset += size
-    head = {name: files[start : start + size].copy() for name, (_p, start, size) in locations.items()}
-    layers = []
-    for index in range(2):
-        tensors = {}
-        for name, size in SIZES.items():
-            xor = _sparse(rng, size, 0.01)
-            head[name] ^= xor
-            tensors[name] = (size, *join_nonzero(size, [nonzero_bytes(xor, 0)]))
-        directory = tmp_path / f"layer{index}"
-        directory.mkdir()
-        write_staging(directory, base_version=f"v{index}", tensors=tensors)
-        layers.append(StagedDelta(directory))
-    delta = {name: _sparse(rng, size, 0.002) for name, size in SIZES.items()}
-    checkpoint = receiver_module._LocalCheckpoint.__new__(receiver_module._LocalCheckpoint)
-    checkpoint.locations = locations
+    checkpoint, head, layers = _staged_scene(tmp_path, rng, SIZES, density=0.01)
+    delta = {name: _sparse_bytes(rng, size, 0.002) for name, size in SIZES.items()}
     yield checkpoint, head, layers, delta
     for layer in layers:
         layer.close()
-
-
-def _passes(head, layers, delta, bases, frames=None):
-    frames = frames or {name: compress_delta(xor).tobytes() for name, xor in delta.items()}
-    return [
-        receiver_module._TensorPass(
-            name,
-            check=memoryview(frames[name]),
-            checksum=_checksum(head[name] ^ delta[name]),
-            overlay=tuple(layer.tensor(name) for layer in layers),
-            base_checksum=bases.get(name),
-        )
-        for name in delta
-    ]
 
 
 def _run(monkeypatch, checkpoint, passes, native):
@@ -103,8 +63,8 @@ def test_native_checks_match_the_python_pass(monkeypatch, scene, bases):
         receiver_module._delta_ext, "check", lambda *args: calls.append(len(args[4])) or check(*args)
     )
 
-    native, native_stats = _run(monkeypatch, checkpoint, _passes(head, layers, delta, known), True)
-    python, python_stats = _run(monkeypatch, checkpoint, _passes(head, layers, delta, known), False)
+    native, native_stats = _run(monkeypatch, checkpoint, _check_passes(head, layers, delta, known), True)
+    python, python_stats = _run(monkeypatch, checkpoint, _check_passes(head, layers, delta, known), False)
 
     assert calls == [len(SIZES)]
     # Python reads every byte; only the C++ checker reads changed ones.
@@ -127,7 +87,7 @@ def test_native_checks_match_the_python_pass(monkeypatch, scene, bases):
 def test_a_native_check_rejects_a_wrong_target(monkeypatch, scene, sparse):
     checkpoint, head, layers, delta = scene
     bases = {name: _checksum(value) for name, value in head.items()} if sparse else {}
-    passes = _passes(head, layers, delta, bases)
+    passes = _check_passes(head, layers, delta, bases)
     passes[2] = receiver_module._TensorPass(
         passes[2].name,
         check=passes[2].check,
@@ -147,7 +107,7 @@ def test_a_delta_in_several_frames_checks_natively(monkeypatch, scene):
     frames["chunks"] = compress_delta(xor[:100_000]).tobytes() + compress_delta(xor[100_000:]).tobytes()
     bases = {name: _checksum(value) for name, value in head.items()}
 
-    sink, stats = _run(monkeypatch, checkpoint, _passes(head, layers, delta, bases, frames), True)
+    sink, stats = _run(monkeypatch, checkpoint, _check_passes(head, layers, delta, bases, frames), True)
 
     assert stats["sparse_checks"] == len(SIZES)
     assert sink["chunks"][1].tolist() == np.flatnonzero(xor).tolist()
@@ -168,7 +128,7 @@ def test_malformed_deltas_fail_as_in_python(monkeypatch, scene, damage):
     failures = []
     for native in (True, False):
         with pytest.raises(Exception) as caught:
-            _run(monkeypatch, checkpoint, _passes(head, layers, delta, bases, frames), native)
+            _run(monkeypatch, checkpoint, _check_passes(head, layers, delta, bases, frames), native)
         failures.append((type(caught.value), str(caught.value)))
 
     assert failures[0] == failures[1]

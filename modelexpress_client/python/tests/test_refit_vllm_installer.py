@@ -3,7 +3,9 @@
 
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -12,6 +14,7 @@ from modelexpress.engines.vllm.host_quantization import (
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress_rl.inference.engines.vllm import installer as installer_module
 from modelexpress_rl.inference.engines.vllm.inplace import InPlaceUnsupported
 from modelexpress_rl.inference.engines.vllm.installer import (
     _copy_received,
@@ -25,7 +28,9 @@ from modelexpress_rl.inference.plan import (
     PreparedRuntimeTensors,
     PreparedStreamingTensors,
 )
-from modelexpress_rl.inference.receiver import PreparedCheckpoint
+from modelexpress_rl.inference.receiver import PreparedCheckpoint, _S3Version
+from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
+from modelexpress_rl.train import WeightPayloadFormat
 from torch import nn
 
 
@@ -2538,11 +2543,6 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
 def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     monkeypatch, window_layers
 ):
-    from unittest.mock import Mock
-    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
-    from modelexpress_rl.inference.receiver import _S3Version
-    from modelexpress_rl.train import WeightPayloadFormat
-
     events = []
     _install_fake_vllm(monkeypatch, lambda model: events.append("initialize"))
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
@@ -2598,8 +2598,6 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
         yield from iterator(files, False, is_distributed)
         paths[-1] = "windowed"
 
-    import modelexpress_rl.inference.engines.vllm.installer as installer_module
-
     monkeypatch.setattr(installer_module, "windowed_weights", windowed)
     monkeypatch.setattr(
         installer_module,
@@ -2642,7 +2640,6 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
         model_config=object(),
         device=torch.device("cpu"),
     )
-    from pathlib import Path
 
     installer.install(
         PreparedCheckpointArtifact(
