@@ -42,7 +42,8 @@ enum Status : uint8_t {
   kFull = 1,      // a full check hit it, without a base checksum
   kFallback = 2,  // a sparse check missed, and a full check hit it
   kMissed = 3,    // a full check missed it
-  kError = 4,     // the delta does not decompress to the tensor's size
+  kError = 4,     // unchecked: the delta does not decompress to the tensor's size,
+                  // or the tensor lies outside its file
 };
 
 struct Layer {
