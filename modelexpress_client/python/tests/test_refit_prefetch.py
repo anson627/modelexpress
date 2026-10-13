@@ -31,6 +31,7 @@ from modelexpress_rl.inference import client as client_module
 from modelexpress_rl.inference import prefetch as prefetch_module
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.checkpoint_store import (
+    PREFETCH_TRIGGER_FILE,
     CheckpointCacheCapacityError,
     CheckpointState,
     LocalCheckpointStore,
@@ -114,7 +115,6 @@ def _settings(tmp_path, *, s3_watch=False, staged=False):
         region_name=None,
         max_replay_chain_length=64,
         rpc_timeout_seconds=1.0,
-        poll_seconds=0.01,
         s3_watch=s3_watch,
         parent_pid=os.getpid(),
         staged=staged,
@@ -133,7 +133,6 @@ def _setup(tmp_path, objects, *, s3_watch=False, staged=False):
     prefetcher = prefetch_module.RefitPrefetcher(
         _settings(tmp_path, s3_watch=s3_watch, staged=staged),
         service=refit,
-        s3=s3,
         checkpoint=checkpoint,
     )
     return s3, checkpoint, refit, prefetcher
@@ -434,7 +433,7 @@ def test_speculation_links_deltas_by_writer_version(tmp_path):
     refit = _FakeRefit()
     refit.add("base", payload=FULL, uri=_uri("weight_v000000"), created=1)
     prefetcher = prefetch_module.RefitPrefetcher(
-        _settings(tmp_path, s3_watch=True), service=refit, s3=s3, checkpoint=checkpoint
+        _settings(tmp_path, s3_watch=True), service=refit, checkpoint=checkpoint
     )
 
     speculative = prefetcher.poll_once()
@@ -455,7 +454,6 @@ def test_prefetcher_indexes_the_head_it_did_not_initialize(tmp_path):
     prefetcher = prefetch_module.RefitPrefetcher(
         _settings(tmp_path, s3_watch=True),
         service=refit,
-        s3=s3,
         checkpoint=_checkpoint(tmp_path, s3, initialize=False),
     )
 
@@ -549,7 +547,7 @@ def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
     assert (version.version_id, version.base_version_id, speculative) == ("v2", "v1", False)
     checkpoint.store.clear_wanted()
     refit.add("v2", payload=XOR, base="v1", uri=_uri("run-v000002"), created=3)
-    prefetcher._settings = dataclasses.replace(prefetcher._settings, poll_seconds=0.0)
+    monkeypatch.setattr(prefetch_module, "POLL_SECONDS", 0.0)
     version, speculative = prefetcher._following(head)()
     assert (version.version_id, speculative) == ("v2", False)
 
@@ -804,7 +802,7 @@ def test_generator_client_starts_and_stops_the_prefetcher(monkeypatch, tmp_path)
     client._rpc_timeout_seconds = 5.0
     client._runtime = SimpleNamespace(methods=(canonical,))
 
-    client._start_prefetcher(SimpleNamespace(object_storage=_config(tmp_path)))
+    client._start_prefetcher(_config(tmp_path))
 
     settings, workers = events[0]
     assert workers == 3
@@ -815,16 +813,17 @@ def test_generator_client_starts_and_stops_the_prefetcher(monkeypatch, tmp_path)
     assert settings.streamed is True
     assert settings.parent_pid == os.getpid()
     # The object-storage method initializes the cache before the client starts.
-    settings.cache_dir().mkdir(parents=True)
+    cache = settings.store().cache
+    cache.mkdir(parents=True)
     client.notify_prefetch()
-    assert (settings.cache_dir() / prefetch_module.TRIGGER_FILE).exists()
+    assert (cache / PREFETCH_TRIGGER_FILE).exists()
     client._stop_prefetcher()
     assert events[-1] == "terminate"
 
 
 def test_prefetcher_process_exits_when_another_serves_the_cache(monkeypatch, tmp_path):
     settings = _settings(tmp_path)
-    cache = settings.cache_dir()
+    cache = settings.store().cache
     cache.mkdir(parents=True)
     connect = Mock()
     monkeypatch.setattr(prefetch_module.RefitPrefetcher, "connect", connect)

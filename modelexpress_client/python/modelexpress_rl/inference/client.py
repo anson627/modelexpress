@@ -32,7 +32,7 @@ from .adapter import GeneratorEngineContext
 from .checkpoint_store import LocalCheckpointStore
 from .methods.canonical_delta import CanonicalDeltaUpdateMethod
 from .plan import WeightSource, parse_weight_source_order
-from .prefetch import POLL_SECONDS, PrefetchSettings, launch_prefetcher
+from .prefetch import PrefetchSettings, launch_prefetcher
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -352,7 +352,7 @@ class ModelExpressGeneratorClient:
                 and rl_envs.MX_REFIT_PREFETCH
                 and rl_envs.LOCAL_RANK in (None, 0)
             ):
-                client._start_prefetcher(config)
+                client._start_prefetcher(config.object_storage)
         except Exception:
             client.close()
             raise
@@ -363,7 +363,7 @@ class ModelExpressGeneratorClient:
         if self._prefetch_store is not None:
             self._prefetch_store.notify_prefetcher()
 
-    def _start_prefetcher(self, config: ModelExpressGeneratorConfig) -> None:
+    def _start_prefetcher(self, object_storage: ObjectStorageGeneratorConfig) -> None:
         canonical = next(
             (
                 method
@@ -372,8 +372,7 @@ class ModelExpressGeneratorClient:
             ),
             None,
         )
-        object_storage = config.object_storage
-        if canonical is None or object_storage is None:
+        if canonical is None:
             return
         settings = PrefetchSettings(
             model_name=self.model_name,
@@ -391,7 +390,6 @@ class ModelExpressGeneratorClient:
             region_name=object_storage.region_name,
             max_replay_chain_length=self._max_replay_chain_length,
             rpc_timeout_seconds=self._rpc_timeout_seconds,
-            poll_seconds=POLL_SECONDS,
             s3_watch=rl_envs.MX_REFIT_PREFETCH_S3_WATCH,
             parent_pid=os.getpid(),
             staged=canonical.staged_checkpoints,

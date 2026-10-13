@@ -6,14 +6,17 @@
 One prefetcher process runs per host checkpoint cache, next to the inference
 engine. It watches the ModelExpress registry for READY versions and, optionally,
 the S3 snapshot prefix for deltas that are not registered yet. It prepares the
-newest version into the host-local cache through the same locked preparation the
-engine's update uses, so a later update finds its target prepared and only
-installs it.
+next version toward the newest registered one, or the next unregistered delta,
+into the host-local cache through the same locked preparation the engine's
+update uses, so a later update finds its target prepared and only installs it.
+Once a staged head the engine serves reaches the layer limit, it writes the
+head's deltas into its files.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import logging
@@ -22,8 +25,8 @@ import posixpath
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any
 
 import grpc
@@ -55,7 +58,6 @@ logger = logging.getLogger("modelexpress_rl.inference.prefetch")
 STATUS_FILE = "prefetch.json"
 # How often the prefetcher checks for new versions.
 POLL_SECONDS = 2.0
-TRIGGER_FILE = PREFETCH_TRIGGER_FILE
 LOCK_FILE = ".prefetch.lock"
 
 # How often a rewrite checks for an engine waiting on a following delta.
@@ -81,7 +83,6 @@ class PrefetchSettings:
     region_name: str | None
     max_replay_chain_length: int
     rpc_timeout_seconds: float
-    poll_seconds: float
     s3_watch: bool
     parent_pid: int
     # Leave verified deltas staged on their base's files, rewritten later.
@@ -96,8 +97,6 @@ class PrefetchSettings:
             seed_checkpoint_path=self.seed_checkpoint_path,
             refit_checkpoint_dir=self.refit_checkpoint_dir,
             refit_checkpoint_max_size_gb=self.refit_checkpoint_max_size_gb,
-            endpoint_url=self.endpoint_url,
-            region_name=self.region_name,
         )
 
     def store(self) -> LocalCheckpointStore:
@@ -105,9 +104,6 @@ class PrefetchSettings:
             root=self.refit_checkpoint_dir,
             model_name=self.cache_model_name,
         )
-
-    def cache_dir(self) -> Path:
-        return self.store().cache
 
 
 def launch_prefetcher(settings: PrefetchSettings, *, workers: int) -> subprocess.Popen:
@@ -127,12 +123,11 @@ class RefitPrefetcher:
         settings: PrefetchSettings,
         *,
         service: Any,
-        s3: S3Client,
         checkpoint: _LocalCheckpoint,
     ) -> None:
         self._settings = settings
         self._service = service
-        self._s3 = s3
+        self._s3 = checkpoint.s3
         self._checkpoint = checkpoint
         self._store = checkpoint.store
         self._channel: grpc.Channel | None = None
@@ -162,7 +157,6 @@ class RefitPrefetcher:
         prefetcher = cls(
             settings,
             service=refit_pb2_grpc.RefitServiceStub(channel),
-            s3=s3,
             checkpoint=checkpoint,
         )
         prefetcher._channel = channel
@@ -192,7 +186,7 @@ class RefitPrefetcher:
                 ),
             )
         if self._settings.s3_watch:
-            prepared = self._speculate(head=state.version, head_source=state.source)
+            prepared = self._speculate(state)
             if prepared is not None:
                 return prepared
         if (
@@ -214,11 +208,14 @@ class RefitPrefetcher:
             )
         return None
 
-    def _following(self, head: CheckpointRecord) -> Any:
+    def _following(
+        self, head: CheckpointRecord
+    ) -> Callable[[], tuple[_S3Version, bool] | None]:
         """Return a check for a delta on top of ``head``, for a rewrite to join.
 
-        An engine waiting to prepare such a delta is seen within a tenth of a
-        second; registry and S3 checks run at most once per poll interval.
+        An engine waiting to prepare such a delta is seen within
+        ``_WANTED_CHECK_SECONDS``; registry and S3 checks run at most once per
+        poll interval.
         """
         checked = {"wanted": 0.0, "remote": time.monotonic()}
 
@@ -229,7 +226,7 @@ class RefitPrefetcher:
                 found = self._wanted_delta(head.version)
                 if found is not None:
                     return found, False
-            if now - checked["remote"] < self._settings.poll_seconds:
+            if now - checked["remote"] < POLL_SECONDS:
                 return None
             checked["remote"] = now
             try:
@@ -237,7 +234,7 @@ class RefitPrefetcher:
                 if version is not None:
                     return version, False
                 if self._settings.s3_watch:
-                    found = self._next_speculative(head=head.version, head_source=head.source)
+                    found = self._next_speculative(head)
                     if found is not None:
                         return found, True
             except Exception as error:
@@ -272,24 +269,22 @@ class RefitPrefetcher:
         while self._parent_alive():
             try:
                 self.poll_once()
-            except grpc.RpcError as error:
-                logger.warning("prefetch poll failed: %s", error)
             except Exception:
                 logger.exception("prefetch poll failed")
-            deadline = time.monotonic() + self._settings.poll_seconds
+            deadline = time.monotonic() + POLL_SECONDS
             while time.monotonic() < deadline and self._parent_alive():
                 current = self._trigger_mtime()
                 if current != trigger:
                     trigger = current
                     break
-                time.sleep(min(0.2, self._settings.poll_seconds))
+                time.sleep(min(0.2, POLL_SECONDS))
 
     def _parent_alive(self) -> bool:
         return os.getppid() == self._settings.parent_pid
 
     def _trigger_mtime(self) -> int | None:
         try:
-            return (self._store.cache / TRIGGER_FILE).stat().st_mtime_ns
+            return (self._store.cache / PREFETCH_TRIGGER_FILE).stat().st_mtime_ns
         except OSError:
             return None
 
@@ -302,7 +297,7 @@ class RefitPrefetcher:
         the active version, which the engine never installs under its own ID.
         """
         active = _active_version(self._store)
-        if active is not None and active == head:
+        if active == head:
             return True
         speculation = self._store.speculation()
         return (
@@ -328,16 +323,36 @@ class RefitPrefetcher:
         target = self._newest_registered() if self._registry_listing else None
         if target is None or target.version_id == head:
             return None
-        chain = self._registered_chain(target, head=head)
-        if not chain or (chain[0].version_id, head) in self._failed:
+        try:
+            chain = resolve_replay_chain(
+                target_version_id=target.version_id,
+                fetch_ready_version=self._fetch_ready_version,
+                max_chain_length=self._settings.max_replay_chain_length,
+                stop_before_version_id=head,
+            )
+        except RuntimeError as error:
+            logger.info("prefetch cannot resolve %s: %s", target.version_id, error)
+            return None
+        if any(
+            version.object_storage.storage_type is not ObjectStorageType.S3
+            for version in chain
+        ):
+            return None
+        version = chain[0]
+        if (version.version_id, head) in self._failed:
             return None
         if (
             self._settings.streamed
-            and chain[0].payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+            and version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
         ):
             # Preparing it here would hold the cache the stream's writer waits on.
             return None
-        return chain[0]
+        return _S3Version(
+            version_id=version.version_id,
+            base_version_id=version.base_version_id,
+            payload_format=version.payload_format,
+            uri=version.object_storage.uri,
+        )
 
     def _newest_registered(self) -> WeightVersion | None:
         try:
@@ -385,44 +400,14 @@ class RefitPrefetcher:
             raise RuntimeError(f"revision {version_id!r} is not a READY model version")
         return version
 
-    def _registered_chain(
-        self, target: WeightVersion, *, head: str
-    ) -> tuple[_S3Version, ...] | None:
-        try:
-            chain = resolve_replay_chain(
-                target_version_id=target.version_id,
-                fetch_ready_version=self._fetch_ready_version,
-                max_chain_length=self._settings.max_replay_chain_length,
-                stop_before_version_id=head,
-            )
-        except RuntimeError as error:
-            logger.info("prefetch cannot resolve %s: %s", target.version_id, error)
-            return None
-        replay = []
-        for version in chain:
-            storage = version.object_storage
-            if storage is None or storage.storage_type is not ObjectStorageType.S3:
-                return None
-            replay.append(
-                _S3Version(
-                    version_id=version.version_id,
-                    base_version_id=version.base_version_id,
-                    payload_format=version.payload_format,
-                    uri=storage.uri,
-                )
-            )
-        return tuple(replay)
-
-    def _speculate(
-        self, *, head: str, head_source: dict[str, str] | None
-    ) -> str | None:
+    def _speculate(self, head: CheckpointRecord) -> str | None:
         """Prepare the unregistered delta whose snapshot names the head as base."""
-        version = self._next_speculative(head=head, head_source=head_source)
-        if version is None or (version.version_id, head) in self._failed:
+        version = self._next_speculative(head)
+        if version is None or (version.version_id, head.version) in self._failed:
             return None
         return self._prepare(
             version.version_id,
-            head=head,
+            head=head.version,
             kind="speculative",
             run=lambda: self._checkpoint.prepare_speculative(
                 version, staged=self._settings.staged
@@ -430,14 +415,12 @@ class RefitPrefetcher:
             uri=version.uri,
         )
 
-    def _next_speculative(
-        self, *, head: str, head_source: dict[str, str] | None
-    ) -> _S3Version | None:
+    def _next_speculative(self, head: CheckpointRecord) -> _S3Version | None:
         """Return the unregistered delta whose snapshot names the head as base."""
         speculation = self._store.speculation()
-        if speculation is not None and speculation.get("version") == head:
+        if speculation is not None and speculation.get("version") == head.version:
             return None
-        head_uri = (head_source or {}).get("uri") or self._registered_uri(head)
+        head_uri = (head.source or {}).get("uri") or self._registered_uri(head.version)
         if head_uri is None:
             return None
         # Snapshots live at <prefix>/<identity>/<index>, and identities sort in
@@ -457,7 +440,7 @@ class RefitPrefetcher:
                 continue
             return _S3Version(
                 version_id=speculative_version_id(uri),
-                base_version_id=head,
+                base_version_id=head.version,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
                 uri=uri,
             )
@@ -465,12 +448,10 @@ class RefitPrefetcher:
 
     def _registered_uri(self, version_id: str) -> str | None:
         try:
-            version = self._fetch_ready_version(version_id)
+            storage = self._fetch_ready_version(version_id).object_storage
         except RuntimeError:
             return None
-        if version.object_storage is None:
-            return None
-        return version.object_storage.uri
+        return None if storage is None else storage.uri
 
     def _writer_version(self, uri: str, *, default: str) -> str:
         """Return the version the snapshot's writer recorded, or ``default``."""
@@ -509,14 +490,14 @@ class RefitPrefetcher:
         *,
         head: str,
         kind: str,
-        run: Any,
+        run: Callable[[], PreparedCheckpoint | None],
         uri: str | None = None,
     ) -> str | None:
         started = time.monotonic()
         self._write_status(phase="preparing", version=version_id, kind=kind, uri=uri)
         logger.info("prefetch preparing %s version %s", kind, version_id)
         try:
-            prepared: PreparedCheckpoint | None = run()
+            prepared = run()
         except Exception as error:
             logger.warning(
                 "prefetch of %s failed; the engine will prepare it: %s", version_id, error
@@ -539,7 +520,8 @@ class RefitPrefetcher:
         )
         state = self._store.state()
         if uri is None and state is not None and state.version == prepared.target_version:
-            # A rewrite can prepare the delta it joined, so name the head's source.
+            # Only speculation passes a URI, so name the prepared head's source,
+            # which for a rewrite can be the delta it joined.
             uri = (state.source or {}).get("uri")
         self._write_status(
             phase="prepared",
@@ -571,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = PrefetchSettings(**json.loads(args.settings))
-    cache_dir = settings.cache_dir()
+    cache_dir = settings.store().cache
     cache_dir.mkdir(parents=True, exist_ok=True)
     with (cache_dir / LOCK_FILE).open("a+") as lock:
         try:
@@ -579,10 +561,8 @@ def main(argv: list[str] | None = None) -> int:
         except BlockingIOError:
             logger.info("another prefetcher already serves %s", cache_dir)
             return 0
-        try:
+        with contextlib.suppress(OSError):
             os.nice(10)
-        except OSError:
-            pass
         prefetcher = RefitPrefetcher.connect(settings)
         try:
             prefetcher.run()
