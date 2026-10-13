@@ -812,25 +812,21 @@ stateDiagram-v2
   pass costs the same however many deltas are staged, apart from XORing their
   bytes in memory, so a small delta stays fast after a dense one. A delta that
   fails its checksums leaves the head unchanged.
-- Where the head's checksum of a tensor is known, the pass reads the tensor only
-  at the bytes the delta changes. Adler-32 is linear in the bytes, so the old and
-  new bytes there turn the head's checksum into the target's. Other tensors are
-  read in full and XORed, and so is every tensor in one of each
-  `MX_REFIT_FULL_CHECK_INTERVAL` deltas (default 8). A tensor whose sparse check
-  misses is read in full before the delta is rejected. The checked target
-  checksums, over the head's for tensors the delta leaves alone, become the
-  target's table. A verified full download starts the tables; a seed copied from
-  `seed_checkpoint_path` has none, so the first delta reads every tensor it
-  changes. Reading only changed bytes relies on the files staying as ModelExpress
-  wrote them. ModelExpress already rejects files whose size or modification time
-  changed, and the full reads catch other corruption.
-- The checks run in a C++ extension when the client was built with it, which
-  decompresses and checks tensors on `MX_REFIT_DELTA_WORKERS` threads without
-  the GIL. A delta it cannot decompress to its tensor's size goes through the
-  Python check, which reports it. Without the extension, or with
-  `MX_REFIT_NATIVE_CHECK=false`, the checks run in Python, where the sparse
-  checks of one file's tensors run in batches. At 64 workers on 8xB300,
-  checking GLM-5.3's deltas took 7.5-8 s natively and 18-22 s in Python.
+- The pass runs in a C++ extension when the client was built with it, on
+  `MX_REFIT_DELTA_WORKERS` threads without the GIL. Where the head's checksum of
+  a tensor is known, it reads the tensor only at the bytes the delta changes:
+  Adler-32 is linear in the bytes, so the old and new bytes there turn the head's
+  checksum into the target's. It reads other tensors in full, as it does every
+  tensor in one of each `MX_REFIT_FULL_CHECK_INTERVAL` deltas (default 8), and a
+  tensor whose sparse check misses before it rejects the delta. Without the
+  extension, or with `MX_REFIT_NATIVE_CHECK=false`, Python reads every tensor in
+  full, several times slower.
+- The checked target checksums, over the head's for tensors the delta leaves
+  alone, become the target's table. A verified full download starts the tables;
+  a seed copied from `seed_checkpoint_path` has none, so the first delta reads
+  every tensor it changes. Reading only changed bytes relies on the files
+  staying as ModelExpress wrote them. ModelExpress already rejects files whose
+  size or modification time changed, and the full reads catch other corruption.
 - Deltas stay staged until there are `MX_REFIT_STAGED_LAYERS` of them (default
   8). Once the engine has activated a head at that limit, the prefetcher writes
   its staged deltas into the files, which makes the head `READY`. A delta on top

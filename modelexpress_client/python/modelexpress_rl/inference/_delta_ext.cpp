@@ -25,10 +25,8 @@
 #include <cstring>
 #include <memory>
 #include <numeric>
-#include <string>
 #include <system_error>
 #include <thread>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -40,11 +38,11 @@ constexpr size_t kChunk = size_t(1) << 20;
 
 // Outcomes of one tensor's check.
 enum Status : uint8_t {
-  kSparse = 0,     // a sparse check hit the target checksum
-  kFull = 1,       // a full check hit it, without a base checksum
-  kFallback = 2,   // a sparse check missed, and a full check hit it
-  kMissed = 3,     // a full check missed it
-  kError = 4,      // the delta does not decompress to the tensor's size
+  kSparse = 0,    // a sparse check hit the target checksum
+  kFull = 1,      // a full check hit it, without a base checksum
+  kFallback = 2,  // a sparse check missed, and a full check hit it
+  kMissed = 3,    // a full check missed it
+  kError = 4,     // the delta does not decompress to the tensor's size
 };
 
 struct Layer {
@@ -66,8 +64,6 @@ struct Tensor {
 
 struct Result {
   Status status = kError;
-  uint32_t checksum = 0;
-  std::string error;
   std::vector<uint32_t> positions;
   std::vector<uint8_t> values;
 };
@@ -130,11 +126,6 @@ struct Overlay {
 template <typename Found>
 void scan(const uint8_t* block, size_t length, size_t start, Found&& found) {
   size_t index = 0;
-  for (; index < length && (reinterpret_cast<uintptr_t>(block + index) & 7) != 0; ++index) {
-    if (block[index] != 0) {
-      found(start + index, block[index]);
-    }
-  }
   for (; index + 8 <= length; index += 8) {
     uint64_t word;
     std::memcpy(&word, block + index, 8);
@@ -154,37 +145,30 @@ void scan(const uint8_t* block, size_t length, size_t start, Found&& found) {
   }
 }
 
-// Decompress into `out` until it is full or the frames end.
+// Decompress into `out` until it is full or the frames end; false if the frames are malformed.
 bool decompress(ZSTD_DCtx* context, ZSTD_inBuffer& input, uint8_t* out, size_t capacity,
-                size_t& written, bool& ended, std::string& error) {
+                size_t& written, bool& ended) {
   ZSTD_outBuffer output{out, capacity, 0};
   for (;;) {
     const size_t hint = ZSTD_decompressStream(context, &output, &input);
     if (ZSTD_isError(hint)) {
-      error = ZSTD_getErrorName(hint);
       return false;
     }
+    written = output.pos;
     // The last frame decoded and flushed, with no input left, is the end.
-    if (hint == 0 && input.pos == input.size) {
-      written = output.pos;
-      ended = true;
-      return true;
-    }
-    if (output.pos == output.size) {
-      written = output.pos;
-      ended = false;
+    ended = hint == 0 && input.pos == input.size;
+    if (ended || output.pos == output.size) {
       return true;
     }
     if (input.pos == input.size) {
-      error = "delta frame is truncated";
       return false;
     }
   }
 }
 
-// Run one check of `tensor`; return false with `error` set if the delta is malformed.
+// Run one check of `tensor` and set `checksum`; false if the delta is malformed.
 bool run(const Tensor& tensor, const uint8_t* old, bool sparse, Scratch& scratch, Result& result,
-         std::string& error) {
+         uint32_t& checksum) {
   ZSTD_DCtx_reset(scratch.context, ZSTD_reset_session_only);
   ZSTD_inBuffer input{tensor.frame, tensor.frame_size, 0};
   std::vector<Overlay> overlays;
@@ -197,18 +181,15 @@ bool run(const Tensor& tensor, const uint8_t* old, bool sparse, Scratch& scratch
   // Sparse sums of byte changes, or the running checksum of the target.
   int64_t low = 0;
   int64_t high = 0;
-  uint32_t checksum = 1;
+  checksum = 1;
   size_t done = 0;
   for (;;) {
     // Past the tensor's end, one more byte shows a delta that runs over.
     const size_t want = std::clamp(tensor.size - done, size_t(1), kChunk);
     size_t written = 0;
     bool ended = false;
-    if (!decompress(scratch.context, input, scratch.chunk.data(), want, written, ended, error)) {
-      return false;
-    }
-    if (done + written > tensor.size) {
-      error = "delta byte size differs";
+    if (!decompress(scratch.context, input, scratch.chunk.data(), want, written, ended) ||
+        done + written > tensor.size) {
       return false;
     }
     const uint8_t* delta = scratch.chunk.data();
@@ -245,7 +226,6 @@ bool run(const Tensor& tensor, const uint8_t* old, bool sparse, Scratch& scratch
     }
   }
   if (done != tensor.size) {
-    error = "delta byte size differs";
     return false;
   }
   if (sparse) {
@@ -256,37 +236,30 @@ bool run(const Tensor& tensor, const uint8_t* old, bool sparse, Scratch& scratch
     weighted += weighted < 0 ? kAdlerBase : 0;
     checksum = uint32_t((weighted << 16) | sum);
   }
-  result.checksum = checksum;
   return true;
 }
 
 void check(const Tensor& tensor, const std::vector<Mapping>& maps, Scratch& scratch, Result& result) {
   const Mapping& map = maps[tensor.file];
+  result.status = kError;
   if (tensor.offset > map.size || tensor.size > map.size - tensor.offset) {
-    result.status = kError;
-    result.error = "tensor lies beyond its checkpoint file";
     return;
   }
   const uint8_t* old = map.data + tensor.offset;
+  uint32_t checksum = 0;
   if (tensor.base >= 0) {
-    if (!run(tensor, old, true, scratch, result, result.error)) {
-      result.status = kError;
+    if (!run(tensor, old, true, scratch, result, checksum)) {
       return;
     }
-    if (result.checksum == tensor.expected) {
+    if (checksum == tensor.expected) {
       result.status = kSparse;
       return;
     }
   }
-  if (!run(tensor, old, false, scratch, result, result.error)) {
-    result.status = kError;
+  if (!run(tensor, old, false, scratch, result, checksum)) {
     return;
   }
-  result.status = result.checksum != tensor.expected ? kMissed : tensor.base >= 0 ? kFallback : kFull;
-  if (result.status == kMissed) {
-    result.positions = {};
-    result.values = {};
-  }
+  result.status = checksum != tensor.expected ? kMissed : tensor.base >= 0 ? kFallback : kFull;
 }
 
 // Run `work(index)` for each index of `order` on up to `threads` threads.
@@ -323,20 +296,15 @@ class Views {
     }
   }
 
-  // The contiguous buffer of `object` with items of `itemsize` bytes and one of `formats`.
-  const void* take(PyObject* object, const char* formats, Py_ssize_t itemsize, size_t& count) {
+  // The contiguous buffer of `object`, as items of `itemsize` bytes.
+  const void* take(PyObject* object, Py_ssize_t itemsize, size_t& count) {
     Py_buffer view;
     if (PyObject_GetBuffer(object, &view, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0) {
       return nullptr;
     }
     views_.push_back(view);
-    const char* format = view.format != nullptr ? view.format : "B";
-    if (format[0] == '<' || format[0] == '=' || format[0] == '@') {
-      ++format;
-    }
-    if (view.itemsize != itemsize || std::strlen(format) != 1 || std::strchr(formats, format[0]) == nullptr) {
-      PyErr_Format(PyExc_ValueError, "buffer of format %s does not hold %zd-byte items", view.format,
-                   itemsize);
+    if (view.itemsize != itemsize) {
+      PyErr_Format(PyExc_ValueError, "buffer holds %zd-byte items, not %zd", view.itemsize, itemsize);
       return nullptr;
     }
     count = size_t(view.len / view.itemsize);
@@ -391,6 +359,8 @@ class Files {
   std::vector<int> descriptors_;
 };
 
+using Owned = std::unique_ptr<PyObject, decltype(&Py_DecRef)>;
+
 PyObject* py_check(PyObject*, PyObject* args) {
   PyObject *paths, *files, *offsets, *sizes, *frames, *bases, *expected, *overlays;
   Py_ssize_t threads;
@@ -400,47 +370,41 @@ PyObject* py_check(PyObject*, PyObject* args) {
   }
   Views views;
   size_t count = 0;
-  const auto* file_index = static_cast<const int64_t*>(views.take(files, "ql", 8, count));
+  const auto* file_index = static_cast<const int64_t*>(views.take(files, 8, count));
   if (file_index == nullptr) {
     return nullptr;
   }
   // Per-tensor arrays, each as long as `files`.
-  auto column = [&](PyObject* object, const char* formats, Py_ssize_t itemsize) -> const void* {
+  auto column = [&](PyObject* object, Py_ssize_t itemsize) -> const void* {
     size_t length = 0;
-    const void* data = views.take(object, formats, itemsize, length);
+    const void* data = views.take(object, itemsize, length);
     if (data != nullptr && length != count) {
       PyErr_SetString(PyExc_ValueError, "per-tensor arguments differ in length");
       return nullptr;
     }
     return data;
   };
-  const auto* offset = static_cast<const int64_t*>(column(offsets, "ql", 8));
-  const auto* size = offset != nullptr ? static_cast<const int64_t*>(column(sizes, "ql", 8)) : nullptr;
-  const auto* base = size != nullptr ? static_cast<const int64_t*>(column(bases, "ql", 8)) : nullptr;
-  const auto* target = base != nullptr ? static_cast<const uint32_t*>(column(expected, "IL", 4)) : nullptr;
+  const auto* offset = static_cast<const int64_t*>(column(offsets, 8));
+  const auto* size = offset != nullptr ? static_cast<const int64_t*>(column(sizes, 8)) : nullptr;
+  const auto* base = size != nullptr ? static_cast<const int64_t*>(column(bases, 8)) : nullptr;
+  const auto* target = base != nullptr ? static_cast<const uint32_t*>(column(expected, 4)) : nullptr;
   if (target == nullptr) {
     return nullptr;
   }
-  PyObject* frame_list = PySequence_Fast(frames, "frames must be a sequence");
-  PyObject* overlay_list = frame_list != nullptr ? PySequence_Fast(overlays, "overlays must be a sequence") : nullptr;
-  std::unique_ptr<PyObject, decltype(&Py_DecRef)> frame_owner(frame_list, Py_DecRef);
-  std::unique_ptr<PyObject, decltype(&Py_DecRef)> overlay_owner(overlay_list, Py_DecRef);
-  if (overlay_list == nullptr) {
+  Owned frame_list(PySequence_Fast(frames, "frames must be a sequence"), Py_DecRef);
+  Owned overlay_list(PySequence_Fast(overlays, "overlays must be a sequence"), Py_DecRef);
+  Owned path_list(PySequence_Fast(paths, "paths must be a sequence"), Py_DecRef);
+  if (frame_list == nullptr || overlay_list == nullptr || path_list == nullptr) {
     return nullptr;
   }
-  if (PySequence_Fast_GET_SIZE(frame_list) != Py_ssize_t(count) ||
-      PySequence_Fast_GET_SIZE(overlay_list) != Py_ssize_t(count)) {
+  if (PySequence_Fast_GET_SIZE(frame_list.get()) != Py_ssize_t(count) ||
+      PySequence_Fast_GET_SIZE(overlay_list.get()) != Py_ssize_t(count)) {
     PyErr_SetString(PyExc_ValueError, "per-tensor arguments differ in length");
     return nullptr;
   }
   Files mapped;
-  PyObject* path_list = PySequence_Fast(paths, "paths must be a sequence");
-  std::unique_ptr<PyObject, decltype(&Py_DecRef)> path_owner(path_list, Py_DecRef);
-  if (path_list == nullptr) {
-    return nullptr;
-  }
-  for (Py_ssize_t index = 0; index < PySequence_Fast_GET_SIZE(path_list); ++index) {
-    const char* path = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(path_list, index));
+  for (Py_ssize_t index = 0; index < PySequence_Fast_GET_SIZE(path_list.get()); ++index) {
+    const char* path = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(path_list.get(), index));
     if (path == nullptr || !mapped.open(path)) {
       return nullptr;
     }
@@ -459,28 +423,28 @@ PyObject* py_check(PyObject*, PyObject* args) {
     tensor.base = base[index];
     tensor.expected = target[index];
     tensor.frame = static_cast<const uint8_t*>(
-        views.take(PySequence_Fast_GET_ITEM(frame_list, Py_ssize_t(index)), "Bbc", 1, tensor.frame_size));
+        views.take(PySequence_Fast_GET_ITEM(frame_list.get(), Py_ssize_t(index)), 1, tensor.frame_size));
     if (tensor.frame == nullptr) {
       return nullptr;
     }
-    PyObject* layers = PySequence_Fast(PySequence_Fast_GET_ITEM(overlay_list, Py_ssize_t(index)),
-                                       "each tensor's overlays must be a sequence");
-    std::unique_ptr<PyObject, decltype(&Py_DecRef)> layer_owner(layers, Py_DecRef);
+    Owned layers(PySequence_Fast(PySequence_Fast_GET_ITEM(overlay_list.get(), Py_ssize_t(index)),
+                                 "each tensor's overlays must be a sequence"),
+                 Py_DecRef);
     if (layers == nullptr) {
       return nullptr;
     }
-    for (Py_ssize_t layer_index = 0; layer_index < PySequence_Fast_GET_SIZE(layers); ++layer_index) {
-      PyObject* pair = PySequence_Fast_GET_ITEM(layers, layer_index);
+    for (Py_ssize_t layer_index = 0; layer_index < PySequence_Fast_GET_SIZE(layers.get()); ++layer_index) {
+      PyObject* pair = PySequence_Fast_GET_ITEM(layers.get(), layer_index);
       if (!PyTuple_Check(pair) || PyTuple_GET_SIZE(pair) != 2) {
         PyErr_SetString(PyExc_ValueError, "an overlay is a (positions, values) pair");
         return nullptr;
       }
       Layer layer{nullptr, nullptr, 0};
       size_t values = 0;
-      layer.positions = static_cast<const uint32_t*>(views.take(PyTuple_GET_ITEM(pair, 0), "IL", 4, layer.count));
-      layer.values = layer.positions != nullptr
-                         ? static_cast<const uint8_t*>(views.take(PyTuple_GET_ITEM(pair, 1), "Bb", 1, values))
-                         : nullptr;
+      layer.positions = static_cast<const uint32_t*>(views.take(PyTuple_GET_ITEM(pair, 0), 4, layer.count));
+      layer.values =
+          layer.positions != nullptr ? static_cast<const uint8_t*>(views.take(PyTuple_GET_ITEM(pair, 1), 1, values))
+                                     : nullptr;
       if (layer.values == nullptr) {
         return nullptr;
       }
@@ -503,31 +467,34 @@ PyObject* py_check(PyObject*, PyObject* args) {
     thread_local Scratch scratch;
     try {
       check(tensors[index], mapped.maps(), scratch, results[index]);
-    } catch (const std::exception& error) {
-      results[index].status = kError;
-      results[index].error = error.what();
-      results[index].positions = {};
-      results[index].values = {};
+    } catch (const std::exception&) {
+      results[index] = Result{};
     }
   });
   Py_END_ALLOW_THREADS;
-  // Each tensor's staged bytes, concatenated in argument order.
+  // Each checked tensor's staged bytes, concatenated in argument order.
   std::vector<int64_t> counts(count);
   std::vector<size_t> starts(count);
+  std::vector<uint8_t> statuses(count);
   size_t total = 0;
   for (size_t index = 0; index < count; ++index) {
+    Result& result = results[index];
+    if (result.status == kMissed || result.status == kError) {
+      result.positions = {};
+      result.values = {};
+    }
+    statuses[index] = result.status;
     starts[index] = total;
-    counts[index] = int64_t(results[index].positions.size());
-    total += results[index].positions.size();
+    counts[index] = int64_t(result.positions.size());
+    total += result.positions.size();
   }
-  PyObject* positions = PyByteArray_FromStringAndSize(nullptr, Py_ssize_t(total * sizeof(uint32_t)));
-  PyObject* values = positions != nullptr ? PyByteArray_FromStringAndSize(nullptr, Py_ssize_t(total)) : nullptr;
-  if (values == nullptr) {
-    Py_XDECREF(positions);
+  Owned positions(PyByteArray_FromStringAndSize(nullptr, Py_ssize_t(total * sizeof(uint32_t))), Py_DecRef);
+  Owned values(PyByteArray_FromStringAndSize(nullptr, Py_ssize_t(total)), Py_DecRef);
+  if (positions == nullptr || values == nullptr) {
     return nullptr;
   }
-  auto* position_bytes = reinterpret_cast<uint8_t*>(PyByteArray_AS_STRING(positions));
-  auto* value_bytes = reinterpret_cast<uint8_t*>(PyByteArray_AS_STRING(values));
+  auto* position_bytes = reinterpret_cast<uint8_t*>(PyByteArray_AS_STRING(positions.get()));
+  auto* value_bytes = reinterpret_cast<uint8_t*>(PyByteArray_AS_STRING(values.get()));
   Py_BEGIN_ALLOW_THREADS;
   parallel(workers - 1, order, [&](size_t index) {
     Result& result = results[index];
@@ -540,39 +507,17 @@ PyObject* py_check(PyObject*, PyObject* args) {
     result.values = {};
   });
   Py_END_ALLOW_THREADS;
-  std::string statuses(count, '\0');
-  std::vector<uint32_t> checksums(count);
-  PyObject* errors = PyDict_New();
-  for (size_t index = 0; errors != nullptr && index < count; ++index) {
-    statuses[index] = char(results[index].status);
-    checksums[index] = results[index].checksum;
-    if (results[index].status == kError) {
-      PyObject* key = PyLong_FromSize_t(index);
-      PyObject* message = PyUnicode_FromString(results[index].error.c_str());
-      if (key == nullptr || message == nullptr || PyDict_SetItem(errors, key, message) != 0) {
-        Py_CLEAR(errors);
-      }
-      Py_XDECREF(key);
-      Py_XDECREF(message);
-    }
-  }
-  if (errors == nullptr) {
-    Py_DECREF(positions);
-    Py_DECREF(values);
-    return nullptr;
-  }
-  return Py_BuildValue("(y#y#y#NNN)", statuses.data(), Py_ssize_t(count),
-                       reinterpret_cast<const char*>(checksums.data()), Py_ssize_t(count * sizeof(uint32_t)),
+  return Py_BuildValue("(y#y#OO)", reinterpret_cast<const char*>(statuses.data()), Py_ssize_t(count),
                        reinterpret_cast<const char*>(counts.data()), Py_ssize_t(count * sizeof(int64_t)),
-                       positions, values, errors);
+                       positions.get(), values.get());
 }
 
 PyMethodDef methods[] = {
     {"check", py_check, METH_VARARGS,
      "check(paths, files, offsets, sizes, frames, bases, expected, overlays, threads)\n\n"
-     "Check zstd XOR deltas against checkpoint files. Returns each tensor's status\n"
-     "and target checksum, the counts of their nonzero delta bytes, those bytes'\n"
-     "offsets and values concatenated, and the errors of malformed deltas."},
+     "Check zstd XOR deltas against checkpoint files. Returns each tensor's status,\n"
+     "the counts of their nonzero delta bytes, and those bytes' offsets and values\n"
+     "concatenated."},
     {nullptr, nullptr, 0, nullptr},
 };
 

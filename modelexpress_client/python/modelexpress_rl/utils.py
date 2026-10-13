@@ -11,7 +11,7 @@ import struct
 import threading
 import zlib
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeVar
@@ -52,67 +52,6 @@ class Adler32Checksum:
 
     def hexdigest(self) -> str:
         return f"{self._value:08x}"
-
-
-class Adler32Change:
-    """Byte changes to one buffer, from which its Adler-32 follows without rereading it.
-
-    Adler-32's sums are linear in the bytes: changing byte ``i`` of ``size`` by ``d``
-    adds ``d`` to the low sum and ``(size - i) * d`` to the high sum.
-    """
-
-    def __init__(self, size: int) -> None:
-        self._size = size
-        self._low = 0
-        self._high = 0
-
-    def add(self, positions: np.ndarray, old: np.ndarray, new: np.ndarray) -> None:
-        """Record that the bytes at ``positions`` changed from ``old`` to ``new``."""
-        difference = new.astype(np.int64) - old.astype(np.int64)
-        weights = (self._size - positions.astype(np.int64)) % _ADLER32_BASE
-        self._low += int(difference.sum())
-        self._high += int((weights * difference).sum())
-
-    def merge(self, other: Adler32Change) -> None:
-        """Record the changes another part of the same buffer recorded."""
-        self._low += other._low
-        self._high += other._high
-
-    def apply(self, checksum: str) -> str:
-        """The changed buffer's checksum, given the hex Adler-32 it had before."""
-        return _shift_adler32(checksum, self._low, self._high)
-
-
-def _shift_adler32(checksum: str, low: int, high: int) -> str:
-    """A hex Adler-32 with ``low`` added to its low sum and ``high`` to its high sum."""
-    value = int(checksum, 16)
-    low = ((value & 0xFFFF) + low) % _ADLER32_BASE
-    high = ((value >> 16) + high) % _ADLER32_BASE
-    return f"{(high << 16) | low:08x}"
-
-
-def adler32_after_changes(
-    checksums: Sequence[str],
-    sizes: np.ndarray,
-    owner: np.ndarray,
-    positions: np.ndarray,
-    old: np.ndarray,
-    new: np.ndarray,
-) -> list[str]:
-    """Each buffer's Adler-32 after its bytes changed, from the hex checksum it had before.
-
-    Byte ``positions[k]`` of buffer ``owner[k]``, of ``sizes[owner[k]]`` bytes,
-    changed from ``old[k]`` to ``new[k]``. ``owner`` is sorted, so each buffer's
-    changes are one run, and a few array operations cover every buffer.
-    """
-    difference = new.astype(np.int64) - old.astype(np.int64)
-    weighted = ((sizes[owner] - positions) % _ADLER32_BASE) * difference
-    bounds = np.searchsorted(owner, np.arange(len(checksums) + 1))
-    sums = []
-    for values in (difference, weighted):
-        totals = np.concatenate(([0], np.cumsum(values)))
-        sums.append((totals[bounds[1:]] - totals[bounds[:-1]]).tolist())
-    return [_shift_adler32(*entry) for entry in zip(checksums, *sums, strict=True)]
 
 
 def checksum_factory(checksum_format: str) -> Adler32Checksum:
@@ -328,9 +267,7 @@ def index_checkpoint_tensors(
 
 
 __all__ = [
-    "Adler32Change",
     "Adler32Checksum",
-    "adler32_after_changes",
     "checksum_factory",
     "compress_delta",
     "compute_delta",

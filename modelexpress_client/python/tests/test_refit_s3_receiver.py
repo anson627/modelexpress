@@ -60,7 +60,7 @@ from modelexpress_rl.inference.staging import (
     write_staging,
 )
 from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
-from modelexpress_rl.utils import Adler32Change, checksum_factory, compress_delta, compute_delta
+from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
 
 
 def _checksum(value):
@@ -3262,22 +3262,14 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
         def __init__(self, reader):
             self.reader = reader
 
-        def record(self, size, read):
-            with read_lock:
-                read_sizes.append(size)
-                if read:
-                    thread_id = threading.get_ident()
-                    read_counts[thread_id] = read_counts.get(thread_id, 0) + 1
-
         def read(self, size):
             block = self.reader.read(size)
-            self.record(size, len(block))
+            with read_lock:
+                read_sizes.append(size)
+                if block:
+                    thread_id = threading.get_ident()
+                    read_counts[thread_id] = read_counts.get(thread_id, 0) + 1
             return block
-
-        def readinto(self, out):
-            read = self.reader.readinto(out)
-            self.record(len(out), read)
-            return read
 
         def close(self):
             self.reader.close()
@@ -3371,21 +3363,6 @@ def test_adler32_checksums_of_parts_combine():
     assert combined.hexdigest() == whole.hexdigest()
 
 
-def test_adler32_of_changed_bytes_follows_from_the_old_checksum():
-    rng = np.random.default_rng(3)
-    data = rng.integers(0, 256, 300_000, dtype=np.uint8)
-    positions = np.sort(rng.choice(data.size, 5_000, replace=False))
-    changed = data.copy()
-    changed[positions] ^= rng.integers(1, 256, positions.size, dtype=np.uint8)
-    whole = Adler32Change(data.size)
-    for part in np.array_split(np.arange(positions.size), 3):
-        piece = Adler32Change(data.size)
-        piece.add(positions[part], data[positions[part]], changed[positions[part]])
-        whole.merge(piece)
-
-    assert whole.apply(_checksum(data)) == _checksum(changed)
-
-
 @pytest.mark.parametrize("wrong_checksum", [False, True])
 def test_large_delta_tensors_spread_their_chunks(monkeypatch, tmp_path, wrong_checksum):
     launch = tmp_path / "launch"
@@ -3451,12 +3428,7 @@ def test_large_delta_tensors_spread_their_chunks(monkeypatch, tmp_path, wrong_ch
 
 
 @pytest.mark.parametrize("workers", [1, 4])
-@pytest.mark.parametrize("path", ["native", "single", "small-batch", "large-batch"])
-def test_sparse_checks_agree_with_full_checks_through_staged_deltas(
-    monkeypatch, tmp_path, workers, path
-):
-    if path == "native" and receiver_module._delta_ext is None:
-        pytest.skip("built without the C++ delta checker")
+def test_a_python_check_through_staged_deltas_spreads_its_chunks(monkeypatch, tmp_path, workers):
     rng = np.random.default_rng(5)
     sizes = {"large": 1000, "small": 40, "unchanged": 24}
 
@@ -3490,58 +3462,45 @@ def test_sparse_checks_agree_with_full_checks_through_staged_deltas(
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", str(workers))
     monkeypatch.setattr(receiver_module, "_APPLY_CHUNK_BYTES", 64)
     monkeypatch.setattr(receiver_module, "_SPREAD_TENSOR_BYTES", 256)
-    monkeypatch.setenv("MX_REFIT_NATIVE_CHECK", str(path == "native").lower())
-    if path == "single":
-        monkeypatch.setattr(receiver_module, "_BATCH_BYTES", 0)
-    elif path == "large-batch":
-        monkeypatch.setattr(receiver_module, "_SMALL_TENSOR_BYTES", 0)
+    monkeypatch.setattr(receiver_module, "_delta_ext", None)
+    sink, stats = {}, {}
 
-    def check(bases):
-        sink, stats = {}, {}
-        checkpoint._run_pass(
-            [
-                receiver_module._TensorPass(
-                    name,
-                    check=frames[name],
-                    checksum=_checksum(head[name] ^ delta[name]),
-                    overlay=tuple(layer.tensor(name) for layer in layers),
-                    base_checksum=bases.get(name),
-                )
-                for name in sizes
-            ],
-            index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
-            sink=sink,
-            stats=stats,
-        )
-        return sink, (stats["sparse_checks"], stats["sparse_fallbacks"])
+    checkpoint._run_pass(
+        [
+            receiver_module._TensorPass(
+                name,
+                check=frames[name],
+                checksum=_checksum(head[name] ^ delta[name]),
+                overlay=tuple(layer.tensor(name) for layer in layers),
+                base_checksum=_checksum(head[name]),
+            )
+            for name in sizes
+        ],
+        index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
+        sink=sink,
+        stats=stats,
+    )
 
-    full, full_stats = check({})
-    known, known_stats = check({name: _checksum(value) for name, value in head.items()})
-    stale, stale_stats = check({name: "00000001" for name in sizes})
-
-    assert (full_stats, known_stats, stale_stats) == ((0, 0), (3, 0), (0, 3))
+    # Python reads every byte, whatever checksum the bytes start from.
+    assert (stats["sparse_checks"], stats["sparse_fallbacks"]) == (0, 0)
     for name, xor in delta.items():
         expected = np.flatnonzero(xor)
-        for sink in (full, known, stale):
-            nbytes, positions, values = sink[name]
-            assert nbytes == sizes[name] and positions.tolist() == expected.tolist()
-            assert values.tolist() == xor[expected].tolist()
+        nbytes, positions, values = sink[name]
+        assert nbytes == sizes[name] and positions.tolist() == expected.tolist()
+        assert values.tolist() == xor[expected].tolist()
     assert np.fromfile(path, dtype=np.uint8).tolist() == files.tolist()
     for layer in layers:
         layer.close()
 
 
-@pytest.mark.parametrize("small", [True, False])
 @pytest.mark.parametrize("native", [True, False])
-def test_a_batched_delta_that_overruns_its_tensor_is_rejected(monkeypatch, tmp_path, small, native):
+def test_a_delta_that_overruns_its_tensor_is_rejected(monkeypatch, tmp_path, native):
     monkeypatch.setenv("MX_REFIT_NATIVE_CHECK", str(native).lower())
     path = tmp_path / "model.bin"
     files = np.arange(48, dtype=np.uint8)
     files.tofile(path)
     checkpoint = receiver_module._LocalCheckpoint.__new__(receiver_module._LocalCheckpoint)
     checkpoint.locations = {"a": (path, 0, 16), "b": (path, 16, 32)}
-    if not small:
-        monkeypatch.setattr(receiver_module, "_SMALL_TENSOR_BYTES", 0)
     delta = {"a": np.zeros(16, dtype=np.uint8), "b": np.zeros(33, dtype=np.uint8)}
     delta["a"][3] = 1
 

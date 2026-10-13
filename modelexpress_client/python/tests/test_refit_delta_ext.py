@@ -107,7 +107,8 @@ def test_native_checks_match_the_python_pass(monkeypatch, scene, bases):
     python, python_stats = _run(monkeypatch, checkpoint, _passes(head, layers, delta, known), False)
 
     assert calls == [len(SIZES)]
-    assert native_stats == python_stats
+    # Python reads every byte; only the C++ checker reads changed ones.
+    assert python_stats == {"sparse_checks": 0, "sparse_fallbacks": 0}
     assert native_stats == {
         "known": {"sparse_checks": len(SIZES), "sparse_fallbacks": 0},
         "unknown": {"sparse_checks": 0, "sparse_fallbacks": 0},
