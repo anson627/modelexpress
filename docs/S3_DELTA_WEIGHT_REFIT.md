@@ -274,9 +274,10 @@ file, XORed, checksummed, and written back; a tensor larger than 256 MiB spreads
 its chunks over the `MX_REFIT_DELTA_WORKERS` threads. Current vLLM and SGLang
 installers consume that
 ordinary checkpoint directory. Materializations are derived and can be rebuilt
-from the canonical lineage. If an in-place delta fails, the running engine keeps
-its previous weights, the cache remains `UPDATING`, and initialization rebuilds
-the checkpoint before accepting another update.
+from the canonical lineage. If a delta fails while it is written into the files,
+the running engine keeps its previous weights, and the cache remains `UPDATING`
+until the refit session or the next initialization restores the initial full
+checkpoint.
 
 `state.json` records whether preparation is `READY`, `STAGED`, or `UPDATING` and
 protects against interrupted writes. A `STAGED` version is verified and staged,
@@ -292,9 +293,14 @@ preparation from entering before activation.
 <refit_checkpoint_dir>/<URL-quoted-MX-model-name>/
   .lock
   .install.lock
+  .prepare.lock
+  .prefetch.lock
   active.json
   state.json
   want.json
+  speculation.json
+  prefetch.json
+  prefetch.trigger
   full/
     v0/
       *.safetensors
@@ -320,7 +326,20 @@ preparation from entering before activation.
       *.safetensors
       config.json
       ...
+  staging/
+    v1/
+      base.json
+      index.json
+      positions.bin
+      values.bin
 ```
+
+Preparations queue on `.prepare.lock`, and `.prefetch.lock` keeps one
+[prefetcher](#background-prefetch) per cache. `speculation.json` names a delta
+prepared before its version registered, `prefetch.json` holds the prefetcher's
+last outcome, and touching `prefetch.trigger` makes it poll at once.
+`staging/<version>/` holds the nonzero bytes of a delta staged for an
+[in-place install](#in-place-install).
 
 The generator may request a target several revisions ahead of its active
 version. ModelExpress first resolves the complete READY chain, rejecting cycles,
@@ -342,8 +361,8 @@ those deltas touched (every expert of a fused MoE, both halves of a packed
 projection) through the same graph-safe layerwise reload. Untouched layers keep
 their kernel tensors. If a fed module is still incomplete, the installer loads
 the rest of the checkpoint in the same reload, which is exactly a full reload.
-Peer installs, bounded tensor streaming, cold start, and failed installs leave the live version unknown,
-so the next checkpoint install is a full reload.
+Peer installs, bounded tensor streaming, and failed installs leave the live
+version unknown, so the next checkpoint install is a full reload.
 Delta lineage uses registry version IDs validated during replay. Writer versions
 in cached XOR index metadata may differ from those IDs and do not determine
 surgical reload eligibility.
@@ -749,26 +768,28 @@ flowchart LR
   through the layerwise reload with the final copy replaced by an XOR. That
   reload's inputs are built on the GPU when it has room, rather than as host
   arrays.
-- Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, vLLM's
-  default on Blackwell, take sparse writes instead. That backend stores each
-  expert's weights as a byte permutation of its checkpoint tensors, and its
-  scales permuted and clamped. The installer derives both maps once per expert
-  shape by sending position codes through vLLM's own per-rank expert loader and
-  kernel-format conversion, then XORs only the staged bytes each rank owns into
-  live memory. Changed scales are rebuilt from the checkpoint files, with the
-  staged deltas since applied, and written as absolute values with the kernel's
-  clamp to every copy the kernel reads. Experts under other FP8 MoE backends
-  take the batched path only when processing keeps them bit for bit: Triton
-  and vLLM CUTLASS always, FlashInfer's TRT-LLM and CUTLASS backends when no
-  scale changed. Otherwise the update reloads.
+- Block-FP8 routed experts under FlashInfer's TRT-LLM MoE backend, the default
+  on Blackwell in the vLLM versions tested, take sparse writes instead. That
+  backend stores each expert's weights as a byte permutation of its checkpoint
+  tensors, and its scales permuted and clamped. The installer derives both maps
+  once per expert shape by sending position codes through vLLM's own per-rank
+  expert loader and kernel-format conversion, then XORs only the staged bytes
+  each rank owns into live memory. Changed scales are rebuilt from the
+  checkpoint files, with the staged deltas since applied, and written as
+  absolute values with the kernel's clamp to every copy the kernel reads.
+  Experts under other FP8 MoE backends take the batched path only when
+  processing keeps them bit for bit: Triton and vLLM CUTLASS always,
+  FlashInfer's TRT-LLM and CUTLASS backends when no scale changed. Otherwise the
+  update reloads.
 - Some modules change values while processing, so XORing their delta would be
-  wrong: FP8 linear layers under DeepGEMM, vLLM's default on Blackwell, which
-  requantizes them to power-of-two scales, and FP8 indexer `wk` weights, which
-  vLLM dequantizes into the indexer's fused weight while loading. These modules
-  reload from the target's values instead, read from the checkpoint files with
-  the staged deltas since applied, and the XOR paths leave them alone. Under
-  `--linear-backend cutlass` or `triton`, FP8 linear layers keep their loaded
-  bits and take the XOR paths, which avoids reloading them.
+  wrong: FP8 linear layers under DeepGEMM, also the default on Blackwell in the
+  vLLM versions tested, which requantizes them to power-of-two scales, and FP8
+  indexer `wk` weights, which vLLM dequantizes into the indexer's fused weight
+  while loading. These modules reload from the target's values instead, read
+  from the checkpoint files with the staged deltas since applied, and the XOR
+  paths leave them alone. Under `--linear-backend cutlass` or `triton`, FP8
+  linear layers keep their loaded bits and take the XOR paths, which avoids
+  reloading them.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
 - Checkpoint headers are parsed once per process. Deltas never change them, so
   each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
@@ -828,11 +849,11 @@ stateDiagram-v2
   `MX_REFIT_DELTA_WORKERS` threads without the GIL. Where the head's checksum of
   a tensor is known, it reads the tensor only at the bytes the delta changes:
   Adler-32 is linear in the bytes, so the old and new bytes there turn the head's
-  checksum into the target's. It reads other tensors in full, as it does each
-  tensor in one of every eight deltas, and a tensor whose sparse check misses
-  before it rejects the delta. Without the
-  extension, or with `MX_REFIT_NATIVE_CHECK=false`, Python reads every tensor in
-  full, several times slower.
+  checksum into the target's. It reads in full the other tensors, every tensor
+  in one of every eight deltas, and a tensor whose sparse check misses, which
+  rejects the delta only if the full read misses too. Without the extension, or
+  with `MX_REFIT_NATIVE_CHECK=false`, Python reads every tensor in full, several
+  times slower.
 - The checked target checksums, over the head's for tensors the delta leaves
   alone, become the target's table. A verified full download starts the tables;
   a seed copied from `seed_checkpoint_path` has none, so the first delta reads

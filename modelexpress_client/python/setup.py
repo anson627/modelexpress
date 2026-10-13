@@ -8,7 +8,7 @@ ext_modules entries that pyproject.toml can't express. Setuptools merges
 the two when both are present.
 
 Pure setuptools build, no CUDA or PyTorch dependency in the extensions:
-they only use the Python C API, and the delta checker libzstd, so they
+they use only the Python C API, plus libzstd for the delta checker, so they
 build anywhere with a C++ toolchain.
 
 Build-time failure of a C extension is non-fatal: pip install succeeds

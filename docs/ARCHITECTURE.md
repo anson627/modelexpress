@@ -1274,8 +1274,8 @@ The vLLM integration exposes engine installation and tensor geometry to
 `GeneratorRuntime`; it does not select a transport or source. Runtime composition
 uses separate NIXL methods for trainer load-time tensors and generator runtime
 tensors, and adds the canonical-checkpoint method when object storage is
-configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
-into the existing mmap-backed checkpoint and become the base for later deltas.
+configured. XOR deltas mutate an exact base; full HF checkpoints are cached as
+new full checkpoints and become the base for later deltas.
 All methods feed the shared private installer, which commits staged tensors or
 reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
 Before a reload, the installer restores registered slots for live kernel buffers
