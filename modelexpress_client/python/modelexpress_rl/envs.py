@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     MX_REFIT_INPLACE: bool
     MX_REFIT_STAGED_LAYERS: int
     MX_REFIT_FULL_CHECK_INTERVAL: int
+    MX_REFIT_NATIVE_CHECK: bool
     MX_REFIT_PREFER_PREPARED: bool
     MX_REFIT_PREFETCH: bool
     MX_REFIT_PREFETCH_POLL_SECONDS: float
@@ -239,6 +240,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A delta's check reads a tensor with a known checksum in full in one of this
     # many deltas, and only its changed bytes otherwise. 1 reads every tensor.
     "MX_REFIT_FULL_CHECK_INTERVAL": lambda: positive_int_env("MX_REFIT_FULL_CHECK_INTERVAL", 8),
+    # Check deltas in the C++ extension when it is built.
+    "MX_REFIT_NATIVE_CHECK": lambda: parse_bool(
+        os.environ.get("MX_REFIT_NATIVE_CHECK", "true"),
+        "MX_REFIT_NATIVE_CHECK",
+    ),
     "RANK": lambda: os.environ.get("RANK"),
 }
 

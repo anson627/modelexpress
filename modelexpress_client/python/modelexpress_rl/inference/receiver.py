@@ -53,6 +53,12 @@ from modelexpress_rl.utils import (
     threadpool_map,
 )
 
+try:
+    from modelexpress_rl.inference import _delta_ext
+except ImportError:
+    # Built without its C++ extension, refit checks deltas in Python.
+    _delta_ext = None
+
 if TYPE_CHECKING:
     from .streaming_checkpoint import StreamedCheckpoint
 
@@ -164,6 +170,11 @@ _SPREAD_TENSOR_BYTES = 256 << 20
 _BATCH_BYTES = 64 << 20
 _BATCH_TENSORS = 4096
 _SMALL_TENSOR_BYTES = 1 << 20
+# The C++ checker's offsets are 32-bit.
+_NATIVE_TENSOR_BYTES = 1 << 32
+# Outcomes of the C++ checker, and the sparse-check outcome each counts as.
+_NATIVE_SPARSE, _NATIVE_FULL, _NATIVE_FALLBACK, _NATIVE_MISSED, _NATIVE_ERROR = range(5)
+_NATIVE_OUTCOMES = {_NATIVE_SPARSE: "sparse", _NATIVE_FULL: None, _NATIVE_FALLBACK: "fallback"}
 
 
 def _read_exactly(fd: int, out: memoryview, offset: int) -> None:
@@ -2176,6 +2187,13 @@ class _LocalCheckpoint:
             for tensor in row
             if tensor is not None
         ]
+        started: set[str] = set()
+        outcomes: list[str | None] = []
+        if stop is None:
+            left, outcomes = self._check_natively(order, index_metadata, sink)
+            started.update(tensor.name for tensor in order)
+            started.difference_update(tensor.name for tensor in left)
+            order = left
         # Every array operation releases the GIL and takes it back, so threads
         # checking many small tensors one by one wait mostly on each other.
         # Sparse checks of tensors in one file run in batches instead, which
@@ -2194,12 +2212,14 @@ class _LocalCheckpoint:
                 items.append(batch)
             batch.append(tensor)
             total[0] += size
+        if not items:
+            self._count_outcomes(stats, outcomes)
+            return started
         checksum_format = index_metadata["checksum_format"]
         decompressor = _DECOMPRESSORS[index_metadata["compression_format"]]
         workers = min(rl_envs.MX_REFIT_DELTA_WORKERS, len(items))
         writes = any(tensor.write is not None or tensor.scatter for tensor in order)
         local = threading.local()
-        started: set[str] = set()
 
         def apply_chunk(
             fd: int,
@@ -2527,7 +2547,7 @@ class _LocalCheckpoint:
                         mapped[path] = np.frombuffer(
                             mmap.mmap(files[path], 0, access=mmap.ACCESS_READ), dtype=np.uint8
                         )
-                outcomes = [
+                outcomes.extend(
                     outcome
                     for part in threadpool_map(
                         scheduled(),
@@ -2536,17 +2556,94 @@ class _LocalCheckpoint:
                         thread_name_prefix="modelexpress-delta-apply",
                     )
                     for outcome in part
-                ]
+                )
             finally:
                 # A map closes once no array views it.
                 mapped.clear()
                 for descriptor in files.values():
                     os.close(descriptor)
+        self._count_outcomes(stats, outcomes)
+        return started
+
+    @staticmethod
+    def _count_outcomes(stats: dict[str, float] | None, outcomes: list[str | None]) -> None:
         if stats is not None:
             fallbacks = outcomes.count("fallback")
             stats["sparse_checks"] = stats.get("sparse_checks", 0) + outcomes.count("sparse")
             stats["sparse_fallbacks"] = stats.get("sparse_fallbacks", 0) + fallbacks
-        return started
+
+    def _check_natively(
+        self,
+        tensors: list[_TensorPass],
+        index_metadata: dict[str, Any],
+        sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None,
+    ) -> tuple[list[_TensorPass], list[str | None]]:
+        """Run the checks the C++ extension can; return the tensors left and the outcomes.
+
+        It takes zstd deltas a pass only checks, of tensors up to 4 GiB, and runs
+        them on MX_REFIT_DELTA_WORKERS threads without the GIL. A delta it cannot
+        decompress to its tensor's size stays for the Python path, which reports
+        it.
+        """
+        if (
+            _delta_ext is None
+            or not rl_envs.MX_REFIT_NATIVE_CHECK
+            or index_metadata.get("compression_format") != "zstd"
+            or index_metadata.get("checksum_format") != "adler32"
+        ):
+            return tensors, []
+        native, left = [], []
+        for tensor in tensors:
+            eligible = (
+                tensor.check is not None
+                and tensor.checksum is not None
+                and tensor.write is None
+                and not tensor.scatter
+                and self.locations[tensor.name][2] <= _NATIVE_TENSOR_BYTES
+                and all(staged.positions.dtype == np.uint32 for staged in tensor.overlay)
+            )
+            (native if eligible else left).append(tensor)
+        if not native:
+            return tensors, []
+        locations = [self.locations[tensor.name] for tensor in native]
+        paths = sorted({path for path, _offset, _size in locations})
+        file_of = {path: index for index, path in enumerate(paths)}
+        status, _checksums, counts, positions, values, _errors = _delta_ext.check(
+            [str(path) for path in paths],
+            np.array([file_of[path] for path, _offset, _size in locations], dtype=np.int64),
+            np.array([offset for _path, offset, _size in locations], dtype=np.int64),
+            np.array([size for _path, _offset, size in locations], dtype=np.int64),
+            [tensor.check for tensor in native],
+            np.array(
+                [-1 if t.base_checksum is None else int(t.base_checksum, 16) for t in native],
+                dtype=np.int64,
+            ),
+            np.array([int(tensor.checksum, 16) for tensor in native], dtype=np.uint32),
+            [tuple((staged.positions, staged.values) for staged in t.overlay) for t in native],
+            rl_envs.MX_REFIT_DELTA_WORKERS,
+        )
+        ends = np.cumsum(np.frombuffer(counts, dtype=np.int64)).tolist()
+        positions = np.frombuffer(positions, dtype=np.uint32)
+        values = np.frombuffer(values, dtype=np.uint8)
+        outcomes: list[str | None] = []
+        begin = 0
+        for tensor, code, (_path, _offset, size), end in zip(
+            native, status, locations, ends, strict=True
+        ):
+            if code == _NATIVE_MISSED:
+                raise ValueError(f"canonical target checksum differs for {tensor.name!r}")
+            if code == _NATIVE_ERROR:
+                left.append(tensor)
+            else:
+                if code == _NATIVE_FALLBACK:
+                    logger.warning(
+                        "Sparse check of %s missed its checksum; reading it in full", tensor.name
+                    )
+                outcomes.append(_NATIVE_OUTCOMES[code])
+                if sink is not None:
+                    sink[tensor.name] = (size, positions[begin:end], values[begin:end])
+            begin = end
+        return left, outcomes
 
     def _validate_prepared(
         self,

@@ -4,21 +4,22 @@
 """Build script for ModelExpress C++ extensions.
 
 Project metadata lives in pyproject.toml. This setup.py only adds the
-ext_modules entry that pyproject.toml can't express. Setuptools merges
+ext_modules entries that pyproject.toml can't express. Setuptools merges
 the two when both are present.
 
-Pure setuptools build, no CUDA or PyTorch dependency in the extension
-itself: the shim only uses the Python C API and dispatches to Python
-callbacks, so it builds anywhere with a C++ toolchain.
+Pure setuptools build, no CUDA or PyTorch dependency in the extensions:
+they only use the Python C API, and the delta checker libzstd, so they
+build anywhere with a C++ toolchain.
 
-Build-time failure of the C extension is non-fatal: pip install
-succeeds without it, and modelexpress.vmm.hook detects the missing
-extension at runtime and disables the arena allocator. Users without a
-working C++ compiler get the pool-reg path; users with one get the
-arena+pool-reg fast path.
+Build-time failure of a C extension is non-fatal: pip install succeeds
+without it, and the runtime detects the missing extension. Without
+modelexpress.vmm._alloc_ext the loader takes the pool-reg path instead of
+the arena allocator; without modelexpress_rl.inference._delta_ext refit
+checks deltas in Python instead.
 """
 
 import os
+import subprocess
 import sys
 import warnings
 
@@ -51,7 +52,9 @@ class BuildExtension(build_ext):
         cxx = os.environ.get("CXX", "g++")
         self.compiler.set_executable("compiler_so", cxx)
         self.compiler.set_executable("compiler_cxx", cxx)
-        self.compiler.set_executable("linker_so", f"{cxx} -shared")
+        # macOS extensions resolve Python's symbols when the interpreter loads them.
+        lookup = " -undefined dynamic_lookup" if sys.platform == "darwin" else ""
+        self.compiler.set_executable("linker_so", f"{cxx} -shared{lookup}")
         try:
             build_ext.build_extensions(self)
         except _OPTIONAL_EXT_ERRORS as e:
@@ -68,12 +71,41 @@ class BuildExtension(build_ext):
         msg = (
             f"Failed to build optional C extension {ext_name}: "
             f"{type(exc).__name__}: {exc}. "
-            "ModelExpress will install pure-Python; MX_VMM_ARENA will be a "
-            "runtime no-op. Install a C++ compiler (g++ or set $CXX) and "
-            "reinstall to enable the arena allocator fast path."
+            f"ModelExpress will install without it; {_SKIPPED.get(ext_name, '')}"
         )
         warnings.warn(msg, stacklevel=2)
         print(f"WARNING: {msg}", file=sys.stderr)
+
+
+# What each optional extension's absence costs, and how to build it.
+_SKIPPED = {
+    "modelexpress.vmm._alloc_ext": (
+        "MX_VMM_ARENA will be a runtime no-op. Install a C++ compiler (g++ or "
+        "set $CXX) and reinstall to enable the arena allocator fast path."
+    ),
+    "modelexpress_rl.inference._delta_ext": (
+        "refit will check deltas in Python. Install a C++ compiler and the "
+        "zstd development files (libzstd-dev or libzstd-devel) and reinstall "
+        "to check them natively."
+    ),
+}
+
+
+def _zstd_dirs():
+    """Include and library directories of libzstd, when pkg-config knows them."""
+    try:
+        flags = subprocess.run(
+            ["pkg-config", "--cflags-only-I", "--libs-only-L", "libzstd"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return {
+        "include_dirs": [flag[2:] for flag in flags if flag.startswith("-I")],
+        "library_dirs": [flag[2:] for flag in flags if flag.startswith("-L")],
+    }
 
 
 def _ext_modules():
@@ -86,6 +118,15 @@ def _ext_modules():
             sources=["modelexpress/vmm/_alloc_ext.cpp"],
             extra_compile_args=extra_compile_args,
             optional=True,
+        ),
+        Extension(
+            name="modelexpress_rl.inference._delta_ext",
+            sources=["modelexpress_rl/inference/_delta_ext.cpp"],
+            extra_compile_args=[*extra_compile_args, "-pthread"],
+            extra_link_args=["-pthread"],
+            libraries=["zstd"],
+            optional=True,
+            **_zstd_dirs(),
         ),
     ]
 

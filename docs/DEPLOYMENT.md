@@ -357,9 +357,12 @@ platform it produces:
 
 - `manylinux_2_28_x86_64` or `manylinux_2_28_aarch64` wheels for cp310,
   cp311, cp312, cp313 (each compiles the `modelexpress.vmm._alloc_ext` shim
-  against the matching CPython ABI and is hardened with `auditwheel repair`)
+  and the `modelexpress_rl.inference._delta_ext` delta checker, linked
+  statically against a pinned zstd release, against the matching CPython ABI
+  and is hardened with `auditwheel repair`)
 - `py3-none-any` pure-Python wheel built with `MX_SKIP_EXT=1` (no compiled
-  extension; runtime falls back to the pool-reg path)
+  extensions; runtime falls back to the pool-reg path and checks refit deltas
+  in Python)
 - sdist tarball
 
 The `manylinux_2_28` base images and `auditwheel` are pinned (by digest and
@@ -1177,7 +1180,10 @@ written into the files while the engine serves, which for a full checkpoint
 needs room in `refit_checkpoint_max_size_gb` for one more copy of its files. A
 delta's check reads a tensor with a verified checksum only where the delta
 changes it, and in full in one of every `MX_REFIT_FULL_CHECK_INTERVAL` deltas
-(default `8`; `1` always reads every tensor). See
+(default `8`; `1` always reads every tensor). The check runs in the C++ delta
+checker when the client was built with it; installs from source need a C++
+compiler and the zstd development files for that, and
+`MX_REFIT_NATIVE_CHECK=false` checks in Python instead. See
 [Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
 For block-FP8 models on Blackwell, routed experts under vLLM's default
 FlashInfer TRT-LLM MoE backend take sparse writes, while FP8 linear layers under

@@ -615,7 +615,10 @@ engine integrations.
   locking, temporary-directory promotion, atomic JSON persistence, artifact
   fingerprints, and activation state.
 - `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
-  and XOR reconstruction into derived checkpoints.
+  and XOR reconstruction into derived checkpoints. Passes that only check
+  deltas run in `inference/_delta_ext.cpp`, an optional C++ extension that
+  decompresses and checks tensors on its own threads without the GIL; without
+  it, they run in Python.
 - `inference/prefetch.py` owns the optional per-cache background process that
   prepares new versions before the update pauses the engine, including
   speculative preparation of unregistered S3 deltas.
@@ -1211,6 +1214,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/methods/` | Trainer load-time tensor, generator runtime tensor, and canonical-checkpoint preparation |
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
+| `inference/_delta_ext.cpp` | Optional C++ delta checker: decompresses zstd XOR deltas, checks target checksums against the checkpoint files through staged deltas, and returns the staged bytes, on its own threads without the GIL. Built best-effort by `setup.py` against libzstd |
 | `inference/prefetch.py` | Optional background preparation of new versions outside the serving pause, plus speculative S3 deltas adopted on registration |
 | `inference/staging.py` | Staged nonzero XOR bytes of a prepared delta, memory-mapped by engine ranks |
 | `inference/engines/vllm/inplace.py` | In-place delta install: routed experts from staged bytes, other tensors through layerwise reload with XOR restore, and modules whose processing changes values through a reload from target values |
