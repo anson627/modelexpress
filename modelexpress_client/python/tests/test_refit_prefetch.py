@@ -15,10 +15,9 @@ from unittest.mock import Mock
 import grpc
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from modelexpress_rl import (
-    ObjectStorageGeneratorConfig,
     ObjectStorageSource,
     ObjectStorageType,
     WeightPayloadFormat,
@@ -40,7 +39,18 @@ from modelexpress_rl.inference.client import ModelExpressGeneratorClient
 from modelexpress_rl.inference.methods import CanonicalDeltaUpdateMethod
 from modelexpress_rl.inference.session import WeightUpdateSession
 from modelexpress_rl.s3 import S3Client
-from tests.refit_fixtures import PREFIX, SHARD, _delta, _delta_snapshot, _FakeS3, _uri
+from tests.refit_fixtures import (
+    PREFIX,
+    SHARD,
+    _checkpoint,
+    _config,
+    _delta,
+    _delta_snapshot,
+    _FakeS3,
+    _files,
+    _uri,
+)
+
 
 class _FakeRefit:
     def __init__(self):
@@ -76,32 +86,6 @@ FULL = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
 XOR = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
 
 
-def _config(tmp_path):
-    launch = tmp_path / "launch"
-    if not launch.exists():
-        launch.mkdir()
-        save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
-    return ObjectStorageGeneratorConfig(
-        storage_type=ObjectStorageType.S3,
-        initial_base_version_id="base",
-        seed_checkpoint_path=launch,
-        refit_checkpoint_dir=tmp_path / "cache",
-        refit_checkpoint_max_size_gb=1,
-    )
-
-
-def _checkpoint(tmp_path, s3, *, initialize=True, stage_deltas=False):
-    checkpoint = receiver_module._LocalCheckpoint(
-        model_name="test/model",
-        config=_config(tmp_path),
-        s3=s3,
-        stage_deltas=stage_deltas,
-    )
-    if initialize:
-        checkpoint.initialize()
-    return checkpoint
-
-
 def _settings(tmp_path, *, s3_watch=False, staged=False):
     return prefetch_module.PrefetchSettings(
         model_name="test/model",
@@ -125,17 +109,41 @@ def _weight(prepared):
     return load_file(prepared.path / "model.safetensors")["weight"]
 
 
-def _setup(tmp_path, objects, *, s3_watch=False, staged=False):
+def _setup(tmp_path, objects, *, s3_watch=False, staged=False, base_identity="run-v000000"):
     s3 = _FakeS3(objects)
     checkpoint = _checkpoint(tmp_path, s3, stage_deltas=staged)
     refit = _FakeRefit()
-    refit.add("base", payload=FULL, uri=_uri("run-v000000"), created=1)
+    refit.add("base", payload=FULL, uri=_uri(base_identity), created=1)
     prefetcher = prefetch_module.RefitPrefetcher(
         _settings(tmp_path, s3_watch=s3_watch, staged=staged),
         service=refit,
         checkpoint=checkpoint,
     )
     return s3, checkpoint, refit, prefetcher
+
+
+# The deltas v1 and v2 most tests register, as new objects on each call.
+def _v1_snapshot():
+    return _delta_snapshot(
+        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+
+
+def _v2_snapshot():
+    return _delta_snapshot(
+        [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
+    )
+
+
+def _wanted(version, base, identity):
+    """What an engine announces while it waits to prepare one staged delta."""
+    return {
+        "version": version,
+        "base_version": base,
+        "uri": _uri(identity),
+        "chain_length": 1,
+        "staged": True,
+    }
 
 
 def test_s3_client_lists_children_and_checks_existence():
@@ -206,10 +214,7 @@ def test_store_rename_version_moves_artifacts_and_chain_references(tmp_path):
 
 
 def test_prefetcher_prepares_the_newest_registered_version(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects)
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot())
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
 
     assert prefetcher.poll_once() == "v1"
@@ -232,15 +237,7 @@ def test_prefetcher_prepares_the_newest_registered_version(tmp_path):
 
 
 def test_prefetcher_prepares_one_version_at_a_time(tmp_path):
-    objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
-        **_delta_snapshot(
-            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
-        ),
-    }
-    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects)
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, {**_v1_snapshot(), **_v2_snapshot()})
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
     refit.add("v2", payload=XOR, base="v1", uri=_uri("run-v000002"), created=3)
 
@@ -273,12 +270,8 @@ def test_a_failed_preparation_is_left_to_the_engine(tmp_path):
 
 def test_a_full_cache_keeps_the_head_a_preparation_started_from(monkeypatch, tmp_path):
     objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
-        **_delta_snapshot(
-            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
-        ),
+        **_v1_snapshot(),
+        **_v2_snapshot(),
         **_delta_snapshot(
             [4.0, 3.0], [4.0, 5.0], identity="run-v000003", base_identity="run-v000002"
         ),
@@ -320,10 +313,7 @@ def test_a_streaming_engine_prepares_full_checkpoints_itself(tmp_path):
 
 
 def test_speculative_prefetch_is_adopted_when_the_version_registers(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot(), s3_watch=True)
     speculative = receiver_module.speculative_version_id(_uri("run-v000001"))
 
     assert prefetcher.poll_once() == speculative
@@ -343,33 +333,22 @@ def test_speculative_prefetch_is_adopted_when_the_version_registers(tmp_path):
     assert prefetcher.poll_once() is None
 
 
-def test_prefetcher_adopts_its_speculation_on_registration(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+@pytest.mark.parametrize("max_replay_chain_length", [64, 1])
+def test_prefetcher_adopts_its_speculation_on_registration(tmp_path, max_replay_chain_length):
+    s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot(), s3_watch=True)
+    prefetcher._settings = dataclasses.replace(
+        prefetcher._settings, max_replay_chain_length=max_replay_chain_length
     )
-    s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
     prefetcher.poll_once()
     downloads = len(s3.gets)
 
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
 
+    # The speculation is never registered, so its lineage ends at its base, and
+    # adopting it renames it without a download.
     assert prefetcher.poll_once() == "v1"
     assert checkpoint.store.state().version == "v1"
     assert len(s3.gets) == downloads
-
-
-def test_a_speculative_head_resolves_its_registration_from_its_base(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
-    prefetcher._settings = dataclasses.replace(prefetcher._settings, max_replay_chain_length=1)
-    prefetcher.poll_once()
-    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
-
-    # The speculation is never registered, so its lineage ends at its base.
-    assert prefetcher.poll_once() == "v1"
-    assert checkpoint.store.state().version == "v1"
 
 
 def test_speculation_runs_when_the_server_cannot_list_versions(tmp_path):
@@ -377,10 +356,7 @@ def test_speculation_runs_when_the_server_cannot_list_versions(tmp_path):
         def code(self):
             return grpc.StatusCode.UNIMPLEMENTED
 
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot(), s3_watch=True)
     refit.ListWeightVersions = Mock(side_effect=_Unimplemented())
 
     speculative = prefetcher.poll_once()
@@ -393,9 +369,7 @@ def test_speculation_runs_when_the_server_cannot_list_versions(tmp_path):
 
 
 def test_speculation_waits_for_every_shard(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
+    objects = _v1_snapshot()
     del objects[f"{PREFIX}/run-v000001/{SHARD}"]
     _s3, checkpoint, _refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
 
@@ -428,12 +402,8 @@ def test_speculation_links_deltas_by_writer_version(tmp_path):
             version="000001",
         ),
     }
-    s3 = _FakeS3(objects)
-    checkpoint = _checkpoint(tmp_path, s3)
-    refit = _FakeRefit()
-    refit.add("base", payload=FULL, uri=_uri("weight_v000000"), created=1)
-    prefetcher = prefetch_module.RefitPrefetcher(
-        _settings(tmp_path, s3_watch=True), service=refit, checkpoint=checkpoint
+    _s3, checkpoint, _refit, prefetcher = _setup(
+        tmp_path, objects, s3_watch=True, base_identity="weight_v000000"
     )
 
     speculative = prefetcher.poll_once()
@@ -443,13 +413,7 @@ def test_speculation_links_deltas_by_writer_version(tmp_path):
 
 
 def test_prefetcher_indexes_the_head_it_did_not_initialize(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    s3 = _FakeS3(objects)
-    _checkpoint(tmp_path, s3)
-    refit = _FakeRefit()
-    refit.add("base", payload=FULL, uri=_uri("run-v000000"), created=1)
+    s3, _engine, refit, _prefetcher = _setup(tmp_path, _v1_snapshot(), s3_watch=True)
     # The prefetcher process attaches to a cache the engine initialized.
     prefetcher = prefetch_module.RefitPrefetcher(
         _settings(tmp_path, s3_watch=True),
@@ -463,14 +427,7 @@ def test_prefetcher_indexes_the_head_it_did_not_initialize(tmp_path):
 
 
 def test_prefetcher_waits_until_the_engine_activates_the_head(tmp_path):
-    objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
-        **_delta_snapshot(
-            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
-        ),
-    }
+    objects = {**_v1_snapshot(), **_v2_snapshot()}
     _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
     assert prefetcher.poll_once() == "v1"
@@ -485,25 +442,16 @@ def test_prefetcher_waits_until_the_engine_activates_the_head(tmp_path):
     )
 
 
-def _head_weight(checkpoint):
-    state = checkpoint.store.state()
-    path = checkpoint.store.checkpoint_path(state.files_version) / "model.safetensors"
-    return load_file(path)["weight"].tolist()
-
-
 def test_staged_prefetch_rewrites_a_head_at_the_layer_limit_once_the_engine_serves_it(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "1")
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, staged=True)
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot(), staged=True)
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
     assert prefetcher.poll_once() == "v1"
     state = checkpoint.store.state()
     assert (state.status, state.base) == (CheckpointState.STAGED, "base")
-    assert _head_weight(checkpoint) == [1.0, 2.0]
+    assert _files(checkpoint) == {"weight": [1.0, 2.0]}
 
     # The engine may still install v1 from the staged files.
     assert prefetcher.poll_once() is None
@@ -511,20 +459,13 @@ def test_staged_prefetch_rewrites_a_head_at_the_layer_limit_once_the_engine_serv
     checkpoint.store.activate("v1")
     assert prefetcher.poll_once() == "v1"
     assert checkpoint.store.state().status is CheckpointState.READY
-    assert _head_weight(checkpoint) == [1.0, 3.0]
+    assert _files(checkpoint) == {"weight": [1.0, 3.0]}
     assert prefetcher.poll_once() is None
 
 
 def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
     monkeypatch.setattr(prefetch_module, "_WANTED_CHECK_SECONDS", 0.0)
-    objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
-        **_delta_snapshot(
-            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
-        ),
-    }
+    objects = {**_v1_snapshot(), **_v2_snapshot()}
     _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, staged=True)
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
     prefetcher.poll_once()
@@ -534,15 +475,7 @@ def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
 
     # Registry checks wait for the poll interval; an engine's wait is seen at once.
     assert following() is None
-    checkpoint.store.write_wanted(
-        {
-            "version": "v2",
-            "base_version": "v1",
-            "uri": _uri("run-v000002"),
-            "chain_length": 1,
-            "staged": True,
-        }
-    )
+    checkpoint.store.write_wanted(_wanted("v2", "v1", "run-v000002"))
     version, speculative = following()
     assert (version.version_id, version.base_version_id, speculative) == ("v2", "v1", False)
     checkpoint.store.clear_wanted()
@@ -555,7 +488,7 @@ def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
     assert prefetcher.poll_once() == "v2"
     state = checkpoint.store.state()
     assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v2", "base")
-    assert _head_weight(checkpoint) == [1.0, 2.0]
+    assert _files(checkpoint) == {"weight": [1.0, 2.0]}
     status = json.loads((checkpoint.store.cache / prefetch_module.STATUS_FILE).read_text())
     assert (status["kind"], status["version"], status["uri"]) == (
         "registered",
@@ -568,27 +501,12 @@ def test_a_rewrite_reports_the_delta_it_prepared(monkeypatch, tmp_path):
     # One staged delta is the limit, so the delta joins the rewrite.
     monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "1")
     monkeypatch.setattr(prefetch_module, "_WANTED_CHECK_SECONDS", 0.0)
-    objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
-        **_delta_snapshot(
-            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
-        ),
-    }
+    objects = {**_v1_snapshot(), **_v2_snapshot()}
     _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, staged=True)
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
     prefetcher.poll_once()
     checkpoint.store.activate("v1")
-    checkpoint.store.write_wanted(
-        {
-            "version": "v2",
-            "base_version": "v1",
-            "uri": _uri("run-v000002"),
-            "chain_length": 1,
-            "staged": True,
-        }
-    )
+    checkpoint.store.write_wanted(_wanted("v2", "v1", "run-v000002"))
 
     assert prefetcher.poll_once() == "v2"
     assert checkpoint.store.state().base == "v1"
@@ -607,9 +525,7 @@ def test_a_rewrite_does_not_join_a_speculative_delta_that_failed_from_its_head(
     monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "1")
     monkeypatch.setattr(prefetch_module, "POLL_SECONDS", 0.0)
     objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
+        **_v1_snapshot(),
         # This delta was computed against other base bytes, so its target check fails.
         **_delta_snapshot(
             [5.0, 5.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
@@ -624,14 +540,11 @@ def test_a_rewrite_does_not_join_a_speculative_delta_that_failed_from_its_head(
     assert prefetcher.poll_once() == "v1"
     state = checkpoint.store.state()
     assert (state.status, state.version) == (CheckpointState.READY, "v1")
-    assert _head_weight(checkpoint) == [1.0, 3.0]
+    assert _files(checkpoint) == {"weight": [1.0, 3.0]}
 
 
 def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, staged=True)
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, _v1_snapshot(), staged=True)
     refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
     prefetcher.poll_once()
     checkpoint.store.activate("v1")
@@ -648,11 +561,8 @@ def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path)
     assert checkpoint.store.state().status is CheckpointState.STAGED
 
 
-def test_an_engine_announces_the_target_it_waits_to_prepare(monkeypatch, tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    s3, checkpoint, _refit, _prefetcher = _setup(tmp_path, objects, staged=True)
+def test_an_engine_announces_the_target_it_waits_to_prepare(tmp_path):
+    s3, checkpoint, _refit, _prefetcher = _setup(tmp_path, _v1_snapshot(), staged=True)
     engine = _checkpoint(tmp_path, s3, initialize=False, stage_deltas=True)
     store = checkpoint.store
 
@@ -666,13 +576,7 @@ def test_an_engine_announces_the_target_it_waits_to_prepare(monkeypatch, tmp_pat
             deadline = time.monotonic() + 5
             while store.wanted() is None and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert store.wanted() == {
-                "version": "v1",
-                "base_version": "base",
-                "uri": _uri("run-v000001"),
-                "chain_length": 1,
-                "staged": True,
-            }
+            assert store.wanted() == _wanted("v1", "base", "run-v000001")
         assert not prepared.result(timeout=5).materialized
 
     assert store.wanted() is None
@@ -681,10 +585,7 @@ def test_an_engine_announces_the_target_it_waits_to_prepare(monkeypatch, tmp_pat
 def test_colocated_ranks_reuse_a_prepared_head_outside_the_preparation_queue(
     monkeypatch, tmp_path
 ):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    s3 = _FakeS3(objects)
+    s3 = _FakeS3(_v1_snapshot())
     leader = _checkpoint(tmp_path, s3)
     target = _delta("v1", base="base", identity="run-v000001")
     leader.prepare_chain((target,))
@@ -706,10 +607,7 @@ def test_colocated_ranks_reuse_a_prepared_head_outside_the_preparation_queue(
 
 
 def test_prefetcher_keeps_a_speculative_head_ahead_of_its_base(tmp_path):
-    objects = _delta_snapshot(
-        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-    )
-    _s3, checkpoint, _refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
+    _s3, checkpoint, _refit, prefetcher = _setup(tmp_path, _v1_snapshot(), s3_watch=True)
     speculative = prefetcher.poll_once()
 
     # The newest registered version is still the base, and speculation is depth one.
@@ -719,12 +617,8 @@ def test_prefetcher_keeps_a_speculative_head_ahead_of_its_base(tmp_path):
 
 def test_unwanted_speculation_is_reverted_before_another_version(tmp_path):
     objects = {
-        **_delta_snapshot(
-            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
-        ),
-        **_delta_snapshot(
-            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
-        ),
+        **_v1_snapshot(),
+        **_v2_snapshot(),
         **_delta_snapshot(
             [1.0, 3.0], [1.0, 9.0], identity="run-v000002b", base_identity="run-v000001"
         ),

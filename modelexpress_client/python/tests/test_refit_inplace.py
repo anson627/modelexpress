@@ -6,9 +6,8 @@
 import dataclasses
 import functools
 import json
-import sys
 import threading
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,7 +15,6 @@ import safetensors.numpy
 import torch
 from safetensors.torch import load_file, save_file
 
-from modelexpress_rl import ObjectStorageGeneratorConfig, ObjectStorageType
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.checkpoint_store import CheckpointState
 from modelexpress_rl.inference.engines.vllm import inplace as inplace_module
@@ -31,7 +29,8 @@ from modelexpress_rl.inference.staging import (
     nonzero_bytes,
     write_staging,
 )
-from modelexpress_rl.utils import compress_delta, compute_delta, index_checkpoint_tensors
+from modelexpress_rl.utils import index_checkpoint_tensors
+from tests import refit_fixtures
 from tests.refit_fixtures import (
     PREFIX,
     SHARD,
@@ -39,7 +38,13 @@ from tests.refit_fixtures import (
     _checksum,
     _delta,
     _delta_snapshot,
+    _fake_modules,
     _FakeS3,
+    _files,
+    _needs_native_check,
+    _save,
+    _sparse_bytes,
+    _tensors_delta_snapshot,
     _uri,
 )
 
@@ -75,7 +80,7 @@ def test_staged_delta_round_trips_nonzero_bytes(tmp_path):
 @pytest.mark.parametrize("size", [0, 7, 8, 17, 4097])
 def test_nonzero_bytes_match_a_byte_scan_at_any_alignment(size, density):
     rng = np.random.default_rng(size)
-    block = np.where(rng.random(size) < density, rng.integers(1, 256, size), 0).astype(np.uint8)
+    block = _sparse_bytes(rng, size, density)
     # Start one byte into a buffer, so 8-byte words are unaligned.
     shifted = np.frombuffer(b"\0" + block.tobytes(), dtype=np.uint8)[1:]
 
@@ -161,30 +166,8 @@ def test_large_tensors_stage_wide_offsets():
     assert large.dtype == np.uint64 and large.tolist() == [1 << 32]
 
 
-def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None, stage_deltas=True):
-    launch = tmp_path / "launch"
-    if not launch.exists():
-        launch.mkdir()
-        tensors = tensors or {"weight": [1.0, 2.0]}
-        save_file(
-            {name: torch.tensor(values) for name, values in tensors.items()},
-            launch / "model.safetensors",
-        )
-    checkpoint = receiver_module._LocalCheckpoint(
-        model_name="test/model",
-        config=ObjectStorageGeneratorConfig(
-            storage_type=ObjectStorageType.S3,
-            initial_base_version_id="base",
-            seed_checkpoint_path=launch,
-            refit_checkpoint_dir=tmp_path / "cache",
-            refit_checkpoint_max_size_gb=1,
-        ),
-        s3=s3,
-        stage_deltas=stage_deltas,
-    )
-    if initialize:
-        checkpoint.initialize()
-    return checkpoint
+# Caches stage each delta's changed bytes, as for an engine that installs in place.
+_checkpoint = functools.partial(refit_fixtures._checkpoint, stage_deltas=True)
 
 
 def test_delta_preparation_stages_nothing_for_an_engine_that_reloads(tmp_path):
@@ -197,7 +180,7 @@ def test_delta_preparation_stages_nothing_for_an_engine_that_reloads(tmp_path):
     assert not checkpoint.store.staging_path("v1").exists()
 
 
-def test_delta_preparation_stages_the_changed_bytes(monkeypatch, tmp_path):
+def test_delta_preparation_stages_the_changed_bytes(tmp_path):
     s3 = _FakeS3(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
     checkpoint = _checkpoint(tmp_path, s3)
 
@@ -218,7 +201,7 @@ def test_delta_preparation_stages_the_changed_bytes(monkeypatch, tmp_path):
     assert reused.staging == prepared.staging and reused.staging_base == "base"
 
 
-def test_staging_follows_speculation_adoption_and_revert(monkeypatch, tmp_path):
+def test_staging_follows_speculation_adoption_and_revert(tmp_path):
     objects = {
         **_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"),
         **_delta_snapshot([1.0, 3.0], [4.0, 3.0], identity="x", base_identity="v1"),
@@ -247,7 +230,7 @@ def test_staging_follows_speculation_adoption_and_revert(monkeypatch, tmp_path):
     assert store.checksums("y") == {"weight": _checksum(_bytes([1.0, 9.0]))}
 
 
-def test_evicting_a_version_removes_its_staging(monkeypatch, tmp_path):
+def test_evicting_a_version_removes_its_staging(tmp_path):
     s3 = _FakeS3(_delta_snapshot([1.0, 2.0], [1.0, 3.0], identity="v1", base_identity="base"))
     checkpoint = _checkpoint(tmp_path, s3)
     checkpoint.prepare_chain((_delta("v1", base="base", identity="v1"),))
@@ -290,26 +273,7 @@ _LINEAGE = {
 
 def _lineage_snapshot(version, base):
     """The delta from ``base`` to ``version`` of every tensor that changes."""
-    tensors, checksums = {}, {}
-    for name, values in _LINEAGE[version].items():
-        delta, changed = compute_delta(_bytes(values), _bytes(_LINEAGE[base][name]))
-        if changed:
-            tensors[name] = compress_delta(delta)
-            checksums[name] = _checksum(_bytes(values))
-    index = json.dumps(
-        {
-            "metadata": {
-                "version": version,
-                "base_version": base,
-                "delta_encoding": "xor",
-                "compression_format": "zstd",
-                "checksum_format": "adler32",
-            },
-            "weight_map": {name: SHARD for name in tensors},
-        }
-    ).encode()
-    shard = safetensors.numpy.save(tensors, metadata=checksums)
-    return {_uri(version): index, f"{PREFIX}/{version}/{SHARD}": shard}
+    return _tensors_delta_snapshot(_LINEAGE[base], _LINEAGE[version], identity=version, base_identity=base)
 
 
 def _lineage_checkpoint(tmp_path, monkeypatch, *, layers=None):
@@ -325,13 +289,6 @@ def _lineage_checkpoint(tmp_path, monkeypatch, *, layers=None):
 def _lineage_delta(version):
     base = {"v1": "base", "v2": "v1", "v3": "v2"}[version]
     return _delta(version, base=base, identity=version)
-
-
-def _files(checkpoint):
-    """The tensors the cache head's checkpoint files hold."""
-    state = checkpoint.store.state()
-    path = checkpoint.store.checkpoint_path(state.files_version) / "model.safetensors"
-    return {name: tensor.tolist() for name, tensor in load_file(path).items()}
 
 
 def _staged_target(prepared):
@@ -407,12 +364,6 @@ def _target_checksums(version):
     return {name: _checksum(_bytes(values)) for name, values in _LINEAGE[version].items()}
 
 
-# Only the C++ checker reads a tensor's changed bytes alone.
-_needs_native_check = pytest.mark.skipif(
-    receiver_module._delta_ext is None, reason="built without the C++ delta checker"
-)
-
-
 def _sparse(prepared):
     return (
         prepared.metrics["perf/mx_receive_delta_sparse_checks"],
@@ -483,17 +434,6 @@ def test_each_tensor_is_read_in_full_once_per_check_interval(monkeypatch, tmp_pa
     assert _staged_target(third) == _LINEAGE["v3"]
 
 
-def test_a_delta_joined_to_a_rewrite_records_its_checksums(monkeypatch, tmp_path):
-    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch, layers=2)
-    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
-    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True))
-
-    prepared = checkpoint.prepare_chain((_lineage_delta("v3"),), staged=True)
-
-    assert prepared.path == checkpoint.store.materialized_path("v2")
-    assert checkpoint.store.checksums("v3") == _target_checksums("v3")
-
-
 def test_at_the_layer_limit_a_delta_writes_the_staged_deltas_in_its_pass(monkeypatch, tmp_path):
     checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch, layers=2)
     store = checkpoint.store
@@ -508,6 +448,7 @@ def test_at_the_layer_limit_a_delta_writes_the_staged_deltas_in_its_pass(monkeyp
     assert prepared.overlay == (store.staging_path("v3"),)
     assert _files(checkpoint) == _LINEAGE["v2"]
     assert _staged_target(prepared) == _LINEAGE["v3"]
+    assert store.checksums("v3") == _target_checksums("v3")
     # Below the limit again, the staged delta stays unwritten.
     checkpoint.activate(prepared)
     assert checkpoint.materialize_head(staged=True) is None
@@ -808,16 +749,8 @@ def test_runs_place_narrow_and_wide_offsets(tmp_path):
 
 
 def _fake_layerwise(monkeypatch, meta):
-    module = ModuleType("vllm.model_executor.model_loader.reload.layerwise")
-    module.get_layerwise_info = lambda _layer: SimpleNamespace(restore_metadata=(meta, {}))
-    for name in (
-        "vllm",
-        "vllm.model_executor",
-        "vllm.model_executor.model_loader",
-        "vllm.model_executor.model_loader.reload",
-    ):
-        monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    monkeypatch.setitem(sys.modules, module.__name__, module)
+    layerwise = {"get_layerwise_info": lambda _layer: SimpleNamespace(restore_metadata=(meta, {}))}
+    _fake_modules(monkeypatch, {"vllm.model_executor.model_loader.reload.layerwise": layerwise})
 
 
 @pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1)])
@@ -946,9 +879,7 @@ def _expert_layers(monkeypatch, tmp_path):
                 deltas[(index, expert, proj)] = delta
                 checkpoint_tensors[name] = torch.zeros(shape, dtype=torch.int32)
                 tensors[name] = (np.zeros(delta.numel() * 4, dtype=np.uint8), delta.reshape(-1).view(torch.uint8).numpy())
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    save_file(checkpoint_tensors, checkpoint / "model.safetensors")
+    checkpoint = _save(tmp_path / "checkpoint", checkpoint_tensors)
     staged = _stage(tmp_path / "staging", tensors)
     return model, checkpoint, staged, deltas
 
@@ -1014,23 +945,36 @@ def test_peers_write_an_expert_layer_sparsely_only_if_all_of_them_can():
     assert layouts == {3: "three"}
 
 
-def test_layers_of_other_pipeline_stages_are_skipped(monkeypatch, tmp_path):
-    class PPMissingLayer(torch.nn.Module):
-        pass
+class PPMissingLayer(torch.nn.Module):
+    """Named like vLLM's placeholder for a layer of another pipeline stage."""
 
+
+@pytest.mark.parametrize(
+    "layers",
+    [
+        # Layer 1 belongs to another pipeline stage.
+        (torch.nn.Module, PPMissingLayer),
+        # Layer 1 is a speculative-decoding layer this model does not build.
+        (torch.nn.Module,),
+    ],
+    ids=["other_stage", "not_built"],
+)
+def test_checkpoint_layers_the_rank_does_not_serve_are_skipped(monkeypatch, tmp_path, layers):
     model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList([torch.nn.Module(), PPMissingLayer()])
+    model.layers = torch.nn.ModuleList([layer() for layer in layers])
     monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
     installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    name = "model.layers.1.mlp.experts.0.gate_proj.weight"
-    save_file({name: torch.zeros(2, dtype=torch.int32)}, checkpoint / "model.safetensors")
-    staged = _stage(tmp_path / "staging", {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8))})
+    names = ["model.layers.1.mlp.experts.0.gate_proj.weight", "model.layers.1.eh_proj.weight"]
+    checkpoint = _save(tmp_path / "checkpoint", {name: torch.zeros(2, dtype=torch.int32) for name in names})
+    staged = _stage(
+        tmp_path / "staging",
+        {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8)) for name in names},
+    )
 
     metrics = installer._install(checkpoint, staged)
 
     assert metrics["perf/mx_receive_inplace_expert_layers"] == 0
+    assert metrics["perf/mx_receive_inplace_generic_tensors"] == 0
     staged.close()
 
 
@@ -1060,10 +1004,8 @@ def test_generic_install_handles_loaders_that_write_live_storage(monkeypatch, tm
     installer = inplace_module.InPlaceInstaller(
         model, device=torch.device("cpu"), generic_reload=lambda load: load(None)
     )
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
     name = "model.layers.0.attn.weight"
-    save_file({name: torch.zeros(4, dtype=torch.int32)}, checkpoint / "model.safetensors")
+    checkpoint = _save(tmp_path / "checkpoint", {name: torch.zeros(4, dtype=torch.int32)})
     delta = torch.tensor([0, 5, 0, 1], dtype=torch.int32)
     staged = _stage(
         tmp_path / "staging",
@@ -1079,37 +1021,13 @@ def test_generic_install_handles_loaders_that_write_live_storage(monkeypatch, tm
     staged.close()
 
 
-def test_checkpoint_layers_the_model_does_not_build_are_skipped(monkeypatch, tmp_path):
-    model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList([torch.nn.Module()])
-    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
-    installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    # Layer 1 is a speculative-decoding layer this model does not serve.
-    names = ["model.layers.1.mlp.experts.0.gate_proj.weight", "model.layers.1.eh_proj.weight"]
-    save_file({name: torch.zeros(2, dtype=torch.int32) for name in names}, checkpoint / "model.safetensors")
-    staged = _stage(
-        tmp_path / "staging",
-        {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8)) for name in names},
-    )
-
-    metrics = installer._install(checkpoint, staged)
-
-    assert metrics["perf/mx_receive_inplace_expert_layers"] == 0
-    assert metrics["perf/mx_receive_inplace_generic_tensors"] == 0
-    staged.close()
-
-
 def test_unrecognized_expert_tensors_are_not_installed_in_place(monkeypatch, tmp_path):
     model = torch.nn.Module()
     model.layers = torch.nn.ModuleList([torch.nn.Module()])
     monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
     installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
     name = "model.layers.0.mlp.experts.0.gate_proj.weight_scale_2"
-    save_file({name: torch.zeros(2, dtype=torch.int32)}, checkpoint / "model.safetensors")
+    checkpoint = _save(tmp_path / "checkpoint", {name: torch.zeros(2, dtype=torch.int32)})
     staged = _stage(tmp_path / "staging", {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8))})
 
     with pytest.raises(inplace_module.InPlaceUnsupported, match="unrecognized"):
@@ -1159,18 +1077,14 @@ def test_processing_a_delta_leaves_the_kernel_on_live_storage(monkeypatch):
         for name, param in info.kernel_tensors[0].items():
             layer.register_parameter(name, param)
 
-    modules = {
-        "vllm.model_executor.model_loader.reload.layerwise": {"_place_kernel_tensors": place, "get_layerwise_info": lambda _layer: info},
-        "vllm.model_executor.model_loader.reload.meta": {"SKIP_TENSORS": set(), "materialize_layer": lambda _l, _i: None, "restore_layer_on_meta": restore_on_meta},
-        "vllm.model_executor.model_loader.reload.utils": {"get_layer_params_buffers": params_buffers, "get_layer_tensors": lambda layer: dict(layer._parameters)},
-    }
-    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.model_loader", "vllm.model_executor.model_loader.reload"):
-        monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    for name, attributes in modules.items():
-        module = ModuleType(name)
-        for key, value in attributes.items():
-            setattr(module, key, value)
-        monkeypatch.setitem(sys.modules, name, module)
+    _fake_modules(
+        monkeypatch,
+        {
+            "vllm.model_executor.model_loader.reload.layerwise": {"_place_kernel_tensors": place, "get_layerwise_info": lambda _layer: info},
+            "vllm.model_executor.model_loader.reload.meta": {"SKIP_TENSORS": set(), "materialize_layer": lambda _l, _i: None, "restore_layer_on_meta": restore_on_meta},
+            "vllm.model_executor.model_loader.reload.utils": {"get_layer_params_buffers": params_buffers, "get_layer_tensors": lambda layer: dict(layer._parameters)},
+        },
+    )
 
     class Method:
         def process_weights_after_loading(self, layer):

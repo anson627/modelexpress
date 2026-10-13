@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,7 +13,7 @@ from modelexpress_rl.inference.engines.vllm import installer as installer_module
 from modelexpress_rl.inference.engines.vllm import sparse_experts
 from modelexpress_rl.inference.engines.vllm.surgical import checkpoint_module, module_groups
 from modelexpress_rl.inference.staging import write_staging
-from safetensors.torch import save_file
+from tests.refit_fixtures import _fake_modules, _save
 from torch import nn
 
 ORACLE = "vllm.model_executor.layers.fused_moe.oracle.fp8"
@@ -123,23 +122,11 @@ def _model(tensors, **kwargs):
 
 @pytest.fixture
 def fake_oracle(monkeypatch):
-    names = [
-        "vllm",
-        "vllm.model_executor",
-        "vllm.model_executor.layers",
-        "vllm.model_executor.layers.fused_moe",
-        "vllm.model_executor.layers.fused_moe.oracle",
-        ORACLE,
-    ]
-    modules = {name: ModuleType(name) for name in names}
-
     def convert(*, fp8_backend, layer, w13, w2, w13_scale, w2_scale, **_):
         assert fp8_backend.name == "FLASHINFER_TRTLLM"
         return _convert(w13, w2, w13_scale, w2_scale)
 
-    modules[ORACLE].convert_to_fp8_moe_kernel_format = convert
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
+    _fake_modules(monkeypatch, {ORACLE: {"convert_to_fp8_moe_kernel_format": convert}})
     monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: RoutedExperts)
 
 
@@ -153,12 +140,6 @@ def _stage(path, base, target):
             tensors[name] = (old.size, positions, (old ^ new)[positions])
     path.mkdir(parents=True, exist_ok=True)
     write_staging(path, base_version="base", tensors=tensors)
-    return path
-
-
-def _save(path, tensors):
-    path.mkdir(parents=True, exist_ok=True)
-    save_file({name: tensor.contiguous() for name, tensor in tensors.items()}, path / "model.safetensors")
     return path
 
 
@@ -333,7 +314,7 @@ class _ValueModel(nn.Module):
         return set()
 
 
-def _value_checkpoint(tmp_path):
+def _value_checkpoint():
     base = {
         "model.layers.0.self_attn.q_b_proj.weight": torch.ones(2, 2),
         "model.layers.0.self_attn.indexer.wk.weight": torch.ones(1, 2).to(torch.float8_e4m3fn),
@@ -351,7 +332,7 @@ def _value_checkpoint(tmp_path):
 @pytest.mark.parametrize("kernel", ["DeepGemmFp8BlockScaledMMKernel", "CutlassFp8BlockScaledMMKernel"])
 def test_modules_whose_processing_changes_values_reload_from_target_values(monkeypatch, tmp_path, kernel):
     monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
-    base, target = _value_checkpoint(tmp_path)
+    base, target = _value_checkpoint()
     model = _ValueModel(kernel)
     staging = _stage(tmp_path / "staging", base, target)
     checkpoint = _save(tmp_path / "checkpoint", target)
