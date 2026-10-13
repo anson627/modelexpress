@@ -56,6 +56,11 @@ def _copy_checkpoint_file(source: str, destination: str) -> str:
 # A prefetcher polls as soon as this file's modification time changes.
 PREFETCH_TRIGGER_FILE = "prefetch.trigger"
 
+# Temporary directories are named this prefix and 32 hex digits, which only
+# initialization's cleanup matches.
+_TEMPORARY_PREFIX = ".checkpoint-"
+_TEMPORARY_PATTERN = _TEMPORARY_PREFIX + "[0-9a-f]" * 32
+
 
 def _encode_cache_component(value: str) -> str:
     """Encode an opaque ID as exactly one filesystem path component."""
@@ -221,7 +226,18 @@ class LocalCheckpointStore:
         ):
             path.mkdir(exist_ok=True)
 
-        with self.locked(shared=True):
+        with self.locked():
+            # Writers fill a temporary directory while they hold this lock, so
+            # one found here was left by a process that stopped mid-write.
+            for root in (
+                self.full_cache,
+                self.delta_cache,
+                self.materialized_cache,
+                self.staging_cache,
+            ):
+                for temporary in root.glob(_TEMPORARY_PATTERN):
+                    logger.info("Removing interrupted checkpoint write %s", temporary)
+                    shutil.rmtree(temporary, ignore_errors=True)
             free_bytes = shutil.disk_usage(self.cache).free
             disk_limit = self.cache_size_bytes() + free_bytes
             if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
@@ -257,8 +273,12 @@ class LocalCheckpointStore:
         *,
         copy_from: Path | None = None,
     ) -> Iterator[Path]:
-        """Populate a temporary directory and promote it to ``target``."""
-        temporary = target.with_name(f".checkpoint-{uuid.uuid4().hex}")
+        """Populate a temporary directory and promote it to ``target``.
+
+        Callers hold the exclusive cache lock, so initialization can remove a
+        temporary directory that a stopped process left.
+        """
+        temporary = target.with_name(f"{_TEMPORARY_PREFIX}{uuid.uuid4().hex}")
         temporary.mkdir(parents=True)
         try:
             if copy_from is not None:
