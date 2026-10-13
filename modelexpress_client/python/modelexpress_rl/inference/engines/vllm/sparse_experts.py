@@ -314,17 +314,25 @@ class SparseExperts:
         copies = scale_copies(module)
         if copies is None:
             raise SparseExpertError("the kernel's scales differ from the layer's")
+        # A projection's changed scales go to the device as one stacked copy.
+        grouped: dict[str, tuple[list[int], list[torch.Tensor]]] = {}
+        for proj, expert, value in scales:
+            experts, values = grouped.setdefault(proj, ([], []))
+            experts.append(expert)
+            values.append(value.reshape(-1))
         writes: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {2: ([], []), 3: ([], [])}
         count = 0
-        for proj, expert, value in scales:
+        for proj, (experts, values) in grouped.items():
             key = (proj, SCALE)
             source = layout.sources[key]
             target = _target(proj, SCALE)
-            writes[target][0].append(expert * layout.slots[target] + layout.maps[key][source])
-            writes[target][1].append(
-                value.to(device=self._device, dtype=torch.float32).reshape(-1)[source]
+            local = torch.tensor(experts, dtype=torch.int64).to(self._device)
+            stacked = torch.stack(values).to(device=self._device, dtype=torch.float32)
+            writes[target][0].append(
+                (local[:, None] * layout.slots[target] + layout.maps[key][source]).reshape(-1)
             )
-            count += 1
+            writes[target][1].append(stacked[:, source].reshape(-1))
+            count += len(experts)
         for target, (indices, values) in writes.items():
             if not indices:
                 continue
