@@ -1583,10 +1583,17 @@ class _VllmInstaller(EngineInstaller):
         """Run one weight loader inside vLLM's graph-safe reload window.
 
         With ``xor``, processed tensors are XORed into live storage instead of
-        copied, for installing a delta in place.
+        copied, for installing a delta in place. A failure there can leave
+        tensors partly XORed that a fallback reload would not rewrite, so it
+        fails the refit.
         """
         with xor_restore() if xor else nullcontext():
-            self._reload_window(load, xor=xor)
+            try:
+                self._reload_window(load, xor=xor)
+            except InPlaceUnsupported as error:
+                if not xor:
+                    raise
+                raise IncompleteRefit(f"in-place reload stopped partway: {error}") from error
 
     def _reload_window(
         self, load: Callable[[_ParameterAliases], None], *, xor: bool

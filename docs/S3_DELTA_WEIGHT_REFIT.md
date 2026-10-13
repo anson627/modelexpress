@@ -794,6 +794,9 @@ flowchart LR
   already XORed belongs to a changed module, which the reload rewrites. Sparse
   writes also skip layers whose tensor-parallel shards vLLM pads to whole
   blocks.
+- An in-place install that fails inside vLLM's reload window fails the update
+  instead. Tensors that no reload would rewrite may already have changed by
+  then.
 - A model qualifies when its processing only rearranges bits. Check a new model,
   quantization, or kernel backend by comparing an in-place install with a
   reload of the same target before enabling it.

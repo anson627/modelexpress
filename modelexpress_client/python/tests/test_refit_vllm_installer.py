@@ -12,6 +12,7 @@ from modelexpress.engines.vllm.host_quantization import (
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress_rl.inference.engines.vllm.inplace import InPlaceUnsupported
 from modelexpress_rl.inference.engines.vllm.installer import (
     _copy_received,
     _standard_module_access,
@@ -600,6 +601,23 @@ def test_reload_rejects_incompatible_graph_bound_tensor(monkeypatch, change):
     )
     with pytest.raises(IncompleteRefit, match="graph-bound tensor.*changed geometry"):
         installer._reload(lambda _aliases: None)
+
+
+def test_an_in_place_reload_that_stops_partway_fails_the_refit(monkeypatch):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=nn.Module(),
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    def load(_aliases):
+        raise InPlaceUnsupported("processed tensor size differs from live storage")
+
+    # Unlike an in-place install refused before it starts, this one cannot reload.
+    with pytest.raises(IncompleteRefit, match="processed tensor size differs"):
+        installer._reload(load, xor=True)
 
 
 def test_reload_accepts_in_place_engine_post_load(monkeypatch):
