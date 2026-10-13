@@ -596,6 +596,23 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
             layer.register_buffer(name, buffer)
 
 
+def _agree_with_peers(flags: torch.Tensor) -> torch.Tensor:
+    """Keep the flags that every tensor-parallel rank of this pipeline stage set."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+    except (ImportError, AssertionError):
+        return flags
+    if group.world_size == 1:
+        return flags
+    agreed = flags.clone()
+    torch.distributed.all_reduce(
+        agreed, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    return agreed
+
+
 # vLLM's DeepSeek-V3.2 and GLM loaders buffer an FP8 indexer wk and its scale
 # here until both arrive. The buffer outlives load_weights, so a stale entry
 # would pair with the wrong tensor.
@@ -1223,6 +1240,7 @@ class _VllmInstaller(EngineInstaller):
                 self._model,
                 device=self._device,
                 generic_reload=lambda load: self._reload(load, xor=True),
+                agree=_agree_with_peers,
                 peers=_tensor_parallel_peers(),
             )
         try:

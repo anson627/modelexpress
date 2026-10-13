@@ -22,7 +22,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -732,6 +732,7 @@ class InPlaceInstaller:
         *,
         device: torch.device,
         generic_reload: Callable[[Callable[[Any], None]], None],
+        agree: Callable[[torch.Tensor], torch.Tensor] | None = None,
         peers: Peers | None = None,
     ) -> None:
         self._model = model
@@ -739,6 +740,9 @@ class InPlaceInstaller:
         self._generic_reload = generic_reload
         # Ranks that split reading staged expert bytes.
         self._peers = peers
+        # Reduces flags to those every tensor-parallel peer set, so peers that
+        # gather staged bytes together take the same path.
+        self._agree = agree
         self._experts = routed_expert_layers(model)
         # Layers this rank does not serve: other pipeline stages' placeholders,
         # and checkpoint layers the model never builds, such as unused MTP layers.
@@ -830,7 +834,9 @@ class InPlaceInstaller:
         if values and reload_values is None:
             raise InPlaceUnsupported(f"processing changes the values of {sorted(values)[:3]}")
         self._sparse.layout_seconds = 0.0
-        layouts = self._sparse_layouts(expert_layers, staged, catalog, metadata)
+        layouts = self._agreed_layouts(
+            expert_layers, self._sparse_layouts(expert_layers, staged, catalog, metadata)
+        )
         for index in expert_layers:
             if index not in layouts:
                 kinds = {
@@ -866,20 +872,31 @@ class InPlaceInstaller:
         )
         sparse_bytes = scale_tensors = 0
         try:
-            for index in expert_layers:
-                runs = itertools.islice(reader, len(layer_runs[index]))
-                if index in layouts:
-                    sparse_bytes += self._install_sparse(
-                        self._experts[index], staged, catalog.experts[index], layouts[index], runs
-                    )
-                else:
-                    self._install_experts(
-                        self._experts[index],
-                        staged,
-                        catalog.experts.get(index, {}),
-                        metadata,
-                        runs,
-                    )
+            try:
+                for index in expert_layers:
+                    runs = itertools.islice(reader, len(layer_runs[index]))
+                    if index in layouts:
+                        sparse_bytes += self._install_sparse(
+                            self._experts[index],
+                            staged,
+                            catalog.experts[index],
+                            layouts[index],
+                            runs,
+                        )
+                    else:
+                        self._install_experts(
+                            self._experts[index],
+                            staged,
+                            catalog.experts.get(index, {}),
+                            metadata,
+                            runs,
+                        )
+            except Exception:
+                # Peers gather every run together, so finish reading them first.
+                with suppress(Exception):
+                    for _run in reader:
+                        pass
+                raise
             if targets is not None:
                 found = targets.result()
                 for index, layout in layouts.items():
@@ -1144,6 +1161,20 @@ class InPlaceInstaller:
             xor_into(live[name].data, original)
         self._input_seconds = input_seconds
         return len(fed)
+
+    def _agreed_layouts(
+        self, expert_layers: list[int], layouts: dict[int, sparse_experts.ExpertLayout]
+    ) -> dict[int, sparse_experts.ExpertLayout]:
+        """Keep the sparse layouts every tensor-parallel peer found.
+
+        A layer that one peer cannot write sparsely may make it refuse the
+        install, which its peers must then refuse before they gather staged runs.
+        """
+        if self._agree is None or not expert_layers:
+            return layouts
+        flags = torch.tensor([index in layouts for index in expert_layers], dtype=torch.int32)
+        agreed = self._agree(flags).tolist()
+        return {index: layouts[index] for index, flag in zip(expert_layers, agreed) if flag}
 
     def _input_device(self, nbytes: int) -> torch.device:
         """Build reload inputs on the GPU when it has room for a few of the largest.

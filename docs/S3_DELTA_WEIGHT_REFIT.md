@@ -793,7 +793,9 @@ flowchart LR
   when the staging is missing or its files do not match its index. Anything
   already XORed belongs to a changed module, which the reload rewrites. Sparse
   writes also skip layers whose tensor-parallel shards vLLM pads to whole
-  blocks.
+  blocks. Tensor-parallel peers read the staged bytes together, so a layer one
+  of them cannot write sparsely takes the other path on all of them, and they
+  fall back together.
 - An in-place install that fails inside vLLM's reload window fails the update
   instead. Tensors that no reload would rewrite may already have changed by
   then.
