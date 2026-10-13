@@ -359,7 +359,8 @@ platform it produces:
   cp311, cp312, cp313 (each compiles the `modelexpress.vmm._alloc_ext` shim
   and the `modelexpress_rl.inference._delta_ext` delta checker, linked
   statically against a pinned zstd release, against the matching CPython ABI
-  and is hardened with `auditwheel repair`)
+  and is hardened with `auditwheel repair`). The build fails if a wheel lacks
+  either extension, which a source install would skip with a warning.
 - `py3-none-any` pure-Python wheel built with `MX_SKIP_EXT=1` (no compiled
   extensions; runtime falls back to the pool-reg path and checks refit deltas
   in Python)
