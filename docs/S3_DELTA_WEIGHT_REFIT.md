@@ -672,9 +672,15 @@ sequenceDiagram
 ```
 
 - The prefetcher watches the MX server for the newest READY version of the
-  model and prepares it into the same host-local cache, under the same locks,
-  as the engine's own update. An update that arrives while preparation runs
-  waits for it instead of repeating it.
+  model and prepares the next version toward it into the same host-local cache,
+  under the same locks, as the engine's own update. One version at a time keeps
+  every version the engine may still be asked for reachable from the cache
+  head. An update that arrives while preparation runs waits for it instead of
+  repeating it.
+- A preparation that fails is not retried from the same cache head. The engine
+  prepares that version itself if it is asked for it, and reports the error.
+- With `MX_REFIT_FULL_STREAMING=true`, the prefetcher leaves full checkpoints to
+  the engine, which streams them as it installs them.
 - With `MX_REFIT_PREFETCH_S3_WATCH=true`, it also lists the snapshot prefix of
   the cache head (`<prefix>/<identity>/model.safetensors.index.json`) for
   identities that sort after the head's. It prepares a delta whose index
