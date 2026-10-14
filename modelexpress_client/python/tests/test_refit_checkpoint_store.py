@@ -105,7 +105,7 @@ def test_materialization_is_independent_and_preserves_copy_metadata(
     assert weights.read_bytes() == b"canonical"
     assert (target / "weights").read_bytes() == b"delta"
     assert bool(calls) == clone
-    assert not target.with_suffix(".tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
 
 
 @pytest.mark.parametrize(
@@ -156,7 +156,7 @@ def test_clone_failure_cleans_partial_tree_without_publishing(
         store.replace_directory(target, copy_from=base),
     ):
         pytest.fail("must not publish a failed copy")
-    assert not target.with_suffix(".tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
     assert target.exists() == existing_target
     if existing_target:
         assert list(target.iterdir()) == [target / "old"]
@@ -197,7 +197,7 @@ def test_materialization_failure_retains_original_target(monkeypatch, tmp_path, 
         (temporary / "weights").write_bytes(b"partial delta")
         fail()
 
-    assert not target.with_suffix(".tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
     assert list(target.iterdir()) == [target / "old"]
     assert (target / "old").read_bytes() == b"old"
     assert (base / "weights").read_bytes() == b"canonical"
@@ -265,6 +265,24 @@ def test_store_owns_the_versioned_layout_and_state(tmp_path):
     assert store.active_version() == "base/a"
 
 
+def test_store_keeps_checksum_tables_of_the_versions_it_is_told_to(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    store.write_checksums("v1", {"a": "00000001"})
+    store.write_checksums("v2", {"a": "00000002", "b": 3}, keep=("v1",))
+
+    assert store.checksums("v1") == {"a": "00000001"}
+    # Only strings are checksums.
+    assert store.checksums("v2") == {"a": "00000002"}
+    assert store.checksums("missing") == {}
+    store.rename_version("v2", "v2/registered")
+    assert store.checksums("v2/registered") == {"a": "00000002"}
+    assert not store.checksums_path("v2").exists()
+    store.write_checksums("v3", {}, keep=())
+    assert not store.checksums_path("v1").exists()
+    assert not store.checksums_path("v2/registered").exists()
+
+
 def test_store_encodes_dot_path_components(tmp_path):
     store = LocalCheckpointStore(root=tmp_path, model_name="..")
     store.initialize()
@@ -288,7 +306,27 @@ def test_store_directory_replacement_rolls_back_on_failure(tmp_path):
             raise RuntimeError("injected failure")
 
     assert (target / "original").read_text() == "original"
-    assert not target.with_name("v1.tmp").exists()
+    assert not list(target.parent.glob(".checkpoint-*"))
+
+
+@pytest.mark.parametrize(
+    "path_for", ["full_path", "delta_path", "materialized_path", "staging_path"]
+)
+def test_store_initialization_removes_interrupted_replacements(tmp_path, path_for):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    # A version ID may end like a temporary name would.
+    kept = getattr(store, path_for)("v2.tmp")
+    kept.mkdir()
+    (kept / "weights").write_bytes(b"kept")
+    # A process that stops while it fills a replacement never promotes it.
+    temporary = store.replace_directory(getattr(store, path_for)("v2")).__enter__()
+    (temporary / "weights").write_bytes(b"partial")
+
+    LocalCheckpointStore(root=tmp_path, model_name="test/model").initialize()
+
+    assert not temporary.exists()
+    assert (kept / "weights").read_bytes() == b"kept"
 
 
 def test_store_rejects_changed_artifacts_and_source_identity(tmp_path):

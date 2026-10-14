@@ -34,6 +34,13 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_INPLACE: bool
+    MX_REFIT_STAGED_LAYERS: int
+    MX_REFIT_NATIVE_CHECK: bool
+    MX_REFIT_PREFER_PREPARED: bool
+    MX_REFIT_PREFETCH: bool
+    MX_REFIT_PREFETCH_S3_WATCH: bool
+    MX_REFIT_PREFETCH_WORKERS: int
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
@@ -200,6 +207,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_TIMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_TIMING", "true"),
         "MX_REFIT_TIMING",
+    ),
+    # Background preparation of object-storage refits outside the serving pause.
+    "MX_REFIT_PREFETCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH", "false"),
+        "MX_REFIT_PREFETCH",
+    ),
+    "MX_REFIT_PREFETCH_S3_WATCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH_S3_WATCH", "false"),
+        "MX_REFIT_PREFETCH_S3_WATCH",
+    ),
+    "MX_REFIT_PREFETCH_WORKERS": lambda: positive_int_env(
+        "MX_REFIT_PREFETCH_WORKERS", min(8, os.cpu_count() or 8)
+    ),
+    "MX_REFIT_PREFER_PREPARED": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFER_PREPARED", "false"),
+        "MX_REFIT_PREFER_PREPARED",
+    ),
+    "MX_REFIT_INPLACE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_INPLACE", "false"),
+        "MX_REFIT_INPLACE",
+    ),
+    # Most deltas checked through staged bytes before a preparation writes the
+    # checkpoint files.
+    "MX_REFIT_STAGED_LAYERS": lambda: positive_int_env("MX_REFIT_STAGED_LAYERS", 8),
+    # Check deltas in the C++ extension when it is built.
+    "MX_REFIT_NATIVE_CHECK": lambda: parse_bool(
+        os.environ.get("MX_REFIT_NATIVE_CHECK", "true"),
+        "MX_REFIT_NATIVE_CHECK",
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }

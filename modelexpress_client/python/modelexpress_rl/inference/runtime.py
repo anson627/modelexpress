@@ -316,6 +316,10 @@ def initialize_generator_runtime(
                     rl_envs.MX_REFIT_FULL_STREAMING
                     and engine.installer.capabilities.streamed_checkpoints
                 ),
+                staged_checkpoints=(
+                    rl_envs.MX_REFIT_INPLACE
+                    and engine.installer.capabilities.staged_checkpoints
+                ),
             )
             methods.append(canonical_method)
         if any(
@@ -399,6 +403,11 @@ def initialize_generator_runtime(
                             and canonical_method.requires_full_root
                         ),
                     )
+                ),
+                prefer_prepared=(
+                    canonical_method.is_prepared
+                    if canonical_method is not None and rl_envs.MX_REFIT_PREFER_PREPARED
+                    else None
                 ),
             ),
             p2p_client=p2p_client,

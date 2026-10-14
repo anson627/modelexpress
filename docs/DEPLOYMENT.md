@@ -357,9 +357,14 @@ platform it produces:
 
 - `manylinux_2_28_x86_64` or `manylinux_2_28_aarch64` wheels for cp310,
   cp311, cp312, cp313 (each compiles the `modelexpress.vmm._alloc_ext` shim
-  against the matching CPython ABI and is hardened with `auditwheel repair`)
+  and the `modelexpress_rl.inference._delta_ext` delta checker against the
+  matching CPython ABI, links the checker statically with a pinned zstd
+  release, and is hardened with `auditwheel repair`). The build fails if a
+  wheel lacks either extension, which a source install would skip with a
+  warning.
 - `py3-none-any` pure-Python wheel built with `MX_SKIP_EXT=1` (no compiled
-  extension; runtime falls back to the pool-reg path)
+  extensions; runtime falls back to the pool-reg path and checks refit deltas
+  in Python)
 - sdist tarball
 
 The `manylinux_2_28` base images and `auditwheel` are pinned (by digest and
@@ -778,6 +783,13 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the modules whose checkpoint tensors the delta chain changed since the engine's last checkpoint install, instead of the whole prepared checkpoint. Falls back to a full reload when the lineage or live version is unknown, or when a fed module is incomplete. See the S3 delta refit guide. |
 | `MX_REFIT_FULL_STREAMING` | `false` | Experimental vLLM full-HF refit: use ModelStreamer once and tee tensors to a bounded background disk writer. Requires distributed ModelStreamer for TP greater than one. Requires `runai-model-streamer>=0.17.0`. Checksummed artifacts and delta replay retain canonical preparation. For S3-compatible storage, set matching `AWS_ENDPOINT_URL` and `AWS_DEFAULT_REGION` on all generator workers; `object_storage_endpoint_url` / `object_storage_region_name` configure only the index reader, not streamed shard reads. See the architecture section on streamed full refit. |
 | `MX_REFIT_STREAM_WINDOW_LAYERS` | `2` | Decoder layers per ranged ModelStreamer request during streamed full refit. Bounds GPU memory held by partially loaded layers; `0` streams the whole checkpoint in one request. |
+| `MX_REFIT_PREFETCH` | `false` | Prepare new object-storage refit versions in a background process before the update pauses the engine. See [Background prefetch](S3_DELTA_WEIGHT_REFIT.md#background-prefetch). |
+| `MX_REFIT_PREFETCH_S3_WATCH` | `false` | Also prepare deltas found in S3 before their versions are registered. Requires `MX_REFIT_PREFETCH`. |
+| `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
+| `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
+| `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. A delta is verified and installed before the checkpoint files are rewritten. See [In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). |
+| `MX_REFIT_STAGED_LAYERS` | `8` | Most deltas staged on the checkpoint files at once. Below it, a delta is checked through the staged ones without writing; at it, a preparation writes them into the files first. See [Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite). |
+| `MX_REFIT_NATIVE_CHECK` | `true` | Check deltas in the C++ delta checker when the client was built with it. `false` checks them in Python. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -1154,11 +1166,34 @@ Full checkpoints are grouped into concurrently uploaded safetensors objects of
 up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
 A single tensor larger than the configured size is uploaded on its own.
 Generators download those objects concurrently through the ModelExpress S3
-client. Each download worker validates one batch and overwrites the matching
-regions in the existing local checkpoint mmaps.
-The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
-only after success. An interrupted update remains unavailable until a fresh
-initialization reseeds it from `seed_checkpoint_path`.
+client. Each download worker validates one batch and writes it into a new full
+checkpoint, which replaces nothing until every batch is in place.
+The receiver marks its local checkpoint `UPDATING` before it changes checkpoint
+files and `READY` only after success. An interrupted update stays `UPDATING`
+until the refit session or the next initialization restores the initial full
+checkpoint.
+
+To keep download and reconstruction out of the serving pause, set
+`MX_REFIT_PREFETCH=true` on generators. A background process per host cache
+then prepares each newly registered version while the engine serves. See
+[Background prefetch](S3_DELTA_WEIGHT_REFIT.md#background-prefetch) for the
+behavior and the related settings.
+
+`MX_REFIT_INPLACE=true` additionally installs a prepared delta into live vLLM
+weights in place instead of reloading every tensor; see [In-place
+install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). Deltas are installed before
+the checkpoint files are rewritten, and `MX_REFIT_STAGED_LAYERS` bounds how many
+wait on the files at once. At that limit they are written into the files while
+the engine serves, which for a full checkpoint needs room in
+`refit_checkpoint_max_size_gb` for one more copy of its files. Deltas are
+checked in the C++ delta checker when the client was built with it; installs
+from source need a C++ compiler and the zstd development files for that. See
+[Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
+For block-FP8 models on Blackwell, routed experts under the FlashInfer TRT-LLM
+MoE backend take sparse writes, while FP8 linear layers under the DeepGEMM
+kernel, both vLLM's defaults there in the versions tested, reload from target
+values during the update; serving with `--linear-backend cutlass` keeps them on
+the faster XOR path.
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish

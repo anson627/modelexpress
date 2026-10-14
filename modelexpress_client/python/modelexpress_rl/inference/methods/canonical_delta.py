@@ -43,6 +43,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         model_name: str,
         config: ObjectStorageGeneratorConfig,
         stream_full_checkpoints: bool = False,
+        staged_checkpoints: bool = False,
     ) -> None:
         if config.storage_type is not ObjectStorageType.S3:
             raise ValueError("only S3 object storage is currently supported")
@@ -57,6 +58,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 model_name=model_name,
                 config=config,
                 s3=self._s3,
+                stage_deltas=staged_checkpoints,
             )
             self._initialized = self._checkpoint.initialize(
                 allow_unrecorded_seed=True,
@@ -66,11 +68,36 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             raise
         self._active: PreparedCheckpointArtifact | None = None
         self._stream_full_checkpoints = stream_full_checkpoints
+        self._staged_checkpoints = staged_checkpoints
         self._streams: list[StreamedCheckpoint] = []
+
+    @property
+    def model_name(self) -> str:
+        """Name keying this method's host checkpoint cache."""
+        return self._model_name
+
+    @property
+    def staged_checkpoints(self) -> bool:
+        """Whether preparations may leave a delta staged on its base's files."""
+        return self._staged_checkpoints
+
+    @property
+    def stream_full_checkpoints(self) -> bool:
+        """Whether full checkpoints stream into the engine as it installs them."""
+        return self._stream_full_checkpoints
 
     @property
     def requires_full_root(self) -> bool:
         return not self._initialized
+
+    def is_prepared(self, version: WeightVersion) -> bool:
+        """Return whether the local cache head already holds ``version``."""
+        if not self._initialized or version.object_storage is None:
+            return False
+        return self._checkpoint.is_prepared(
+            version_id=version.version_id,
+            uri=version.object_storage.uri,
+        )
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -173,11 +200,18 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                             seed_checkpoint_path=seed,
                         ),
                         s3=self._s3,
+                        stage_deltas=self._staged_checkpoints,
                     )
                     checkpoint.initialize()
                     self._checkpoint = checkpoint
                     self._initialized = True
-                checkpoint = self._checkpoint.prepare_chain(tuple(versions))
+                started = time.perf_counter()
+                checkpoint = self._checkpoint.prepare_chain(
+                    tuple(versions), staged=self._staged_checkpoints
+                )
+                checkpoint.metrics["perf/mx_receive_prepare_time"] = (
+                    time.perf_counter() - started
+                )
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)

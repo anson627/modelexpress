@@ -615,23 +615,29 @@ engine integrations.
   locking, temporary-directory promotion, atomic JSON persistence, artifact
   fingerprints, and activation state.
 - `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
-  and XOR reconstruction into derived checkpoints.
+  and XOR reconstruction into derived checkpoints, checking deltas in the
+  optional C++ extension `inference/_delta_ext.cpp` when it is built.
+- `inference/prefetch.py` owns the optional background preparation of new
+  versions outside the serving pause.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
+- `inference/staging.py` owns a prepared delta's staged nonzero XOR bytes,
+  which `inference/engines/vllm/inplace.py` and
+  `inference/engines/vllm/sparse_experts.py` install into live vLLM weights.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
-leader has reconstructed a target, followers verify and attach to that READY
-checkpoint with shared installation and cache locks. They can therefore prepare
-while another rank loads the same checkpoint. A cache miss releases the shared
-locks, acquires the exclusive installation/cache fences, and rechecks the state
-before reconstructing. Cache-hit attachment performs no eviction; capacity is
-enforced by initialization, reconstruction, and activation.
+leader has reconstructed a target, followers verify and attach to that READY or
+STAGED checkpoint with shared installation and cache locks. They can therefore
+prepare while another rank loads the same checkpoint. A cache miss releases the
+shared locks, acquires the exclusive installation/cache fences, and rechecks the
+state before reconstructing. Cache-hit attachment performs no eviction; capacity
+is enforced by initialization, reconstruction, and activation.
 
 | Canonical checkpoint operation | `.prepare.lock` | `.install.lock` | `.lock` |
 |---|---|---|---|
-| Attach to an already prepared target | Exclusive | Shared | Shared |
+| Attach to an already prepared target | Exclusive, head check only | Shared | Shared |
 | Reconstruct a target | Exclusive | Exclusive | Exclusive |
 | Load engine weights | None | Shared | Shared |
 | Commit activation when the installation context exits | None | Shared | Exclusive |
@@ -1202,6 +1208,11 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/methods/` | Trainer load-time tensor, generator runtime tensor, and canonical-checkpoint preparation |
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
+| `inference/_delta_ext.cpp` | Optional C++ delta checker: decompresses zstd XOR deltas, checks target checksums against the checkpoint files through staged deltas, and returns the staged bytes, on its own threads without the GIL. Built best-effort by `setup.py` against libzstd |
+| `inference/prefetch.py` | Optional background preparation of new versions outside the serving pause, plus speculative S3 deltas adopted on registration |
+| `inference/staging.py` | Staged nonzero XOR bytes of a prepared delta, memory-mapped by engine ranks |
+| `inference/engines/vllm/inplace.py` | In-place delta install: routed experts from staged bytes, other tensors through layerwise reload with XOR restore, and modules whose processing changes values through a reload from target values |
+| `inference/engines/vllm/sparse_experts.py` | Sparse writes of staged block-FP8 expert bytes into live MoE kernel tensors, with checkpoint-to-live maps derived from vLLM's per-rank loader and kernel conversion |
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
@@ -1257,8 +1268,8 @@ The vLLM integration exposes engine installation and tensor geometry to
 `GeneratorRuntime`; it does not select a transport or source. Runtime composition
 uses separate NIXL methods for trainer load-time tensors and generator runtime
 tensors, and adds the canonical-checkpoint method when object storage is
-configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
-into the existing mmap-backed checkpoint and become the base for later deltas.
+configured. XOR deltas mutate an exact base; full HF checkpoints are cached as
+new full checkpoints and become the base for later deltas.
 All methods feed the shared private installer, which commits staged tensors or
 reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
 Before a reload, the installer restores registered slots for live kernel buffers
@@ -1280,7 +1291,11 @@ update carries the opaque MX `version_id`.
 applies the version through `ModelExpressGeneratorClient`, and
 `finish_weight_update()` releases its staged handle. Each session accepts one
 version; calls before initialization, out-of-order calls, and a second update
-raise instead of reporting success. vLLM's reset hook releases staged resources
+raise instead of reporting success. Orchestrators may repeat
+`init_weight_transfer_engine()` before every update: a repeat for the same
+model returns at once and only asks the background prefetcher to poll,
+because vLLM runs it inside the engine loop. A repeat for another model
+raises. vLLM's reset hook releases staged resources
 and clears the session after an update error, including invalid payloads rejected
 before receiving weights. A failed finish retains the session so cleanup can be
 retried; already applied model weights are not rolled back. Draft-model updates remain
@@ -1289,7 +1304,9 @@ WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
 the bridge merges staging
 and installation metrics and logs each numeric `perf/` phase as a separate INFO
 line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
-complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
+complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call, and
+`perf/mx_receive_prepare_time` the part of it spent preparing an object-storage
+checkpoint.
 
 `engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The
