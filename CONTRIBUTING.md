@@ -229,9 +229,3 @@ If your pull request fails the DCO check, add the trailer to the existing commit
 git rebase --signoff origin/main
 git push --force-with-lease
 ```
-
-## CoreWeave release workflow
-
-Changes to `.github/workflows/release.yml` should pass `actionlint` and the
-repository pre-commit hooks. See [Artifactory releases](docs/DEPLOYMENT.md#coreweave-artifactory-releases)
-for provisioning, runner requirements, branch routing, and image outputs.
