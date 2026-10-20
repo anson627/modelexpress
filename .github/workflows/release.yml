@@ -86,7 +86,7 @@ jobs:
       matrix:
         include:
           - image: modelexpress-server
-            dockerfile: docker/Dockerfile
+            dockerfile: docker/modelexpress-server/Dockerfile
           - image: modelexpress-vllm-runtime
             dockerfile: examples/rl/dynamo_vllm_s3_delta_refit/Dockerfile
     steps:
