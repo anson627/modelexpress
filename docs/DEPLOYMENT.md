@@ -1937,3 +1937,69 @@ run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunni
 the whole GitHub workflow uses a new attempt and does not recover an older retained
 namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.
+
+## CoreWeave Artifactory releases
+
+The `Release container images` workflow builds `linux/amd64` and `linux/arm64` server and vLLM
+runtime images on pushes to `internal`, or by manual dispatch on `internal` or
+the repository's default branch. It uses JFrog OIDC authentication following the
+[CoreWeave publishing guide](https://docs.cw.dev/cicd/artifact-management/pushing-to-artifactory/).
+The runtime is built using the Dockerfile in the selected source commit, with
+Dynamo's sidecar at
+`c3e05f0244ae6264d7953f68e2499c6dc2f54723`. Use the matching Dynamo frontend.
+GPU inference on B300 must still be validated separately.
+
+Before publishing, merge `.cw/artifact-mgmt/config.yaml` to the **default branch**
+(currently `main`) so ACP provisions the OCI repositories and OIDC mappings for
+`coreweave/inference`. Merging only to `internal` does not provision them. The
+workflow must also exist on the default branch for GitHub's manual dispatch UI.
+Keep the workflow and artifact config in sync when updating the upstream mirror.
+
+ACP supplies `ARTIFACTORY_OCI_DEV_REPOSITORY` and
+`ARTIFACTORY_OCI_PROD_REPOSITORY`; organization variables supply
+`ARTIFACTORY_INSTANCE_URL`, `ARTIFACTORY_PROJECT_KEY`,
+`ARTIFACTORY_OIDC_PROVIDER_NAME`, and `ARTIFACTORY_OIDC_AUDIENCE`. No long-lived
+registry password is needed. Default-branch runs select the production repository;
+other allowed runs select development. With `main` still the default, `internal`
+builds are development artifacts with a 30-day retention policy and must not be
+used in production. Production publishing is manually dispatched on the default
+branch with a required `release_tag` input. The workflow resolves that exact Git
+tag once, then both image jobs check out the same commit. The workflow's OIDC
+identity remains on the default branch even when the tag points to a release
+branch. Pushing a tag alone does not trigger publishing.
+
+For example, after pushing `v0.1.0` from your release branch, run:
+
+```bash
+gh workflow run release.yml --repo coreweave/modelexpress --ref main \
+  -f release_tag=v0.1.0
+```
+
+Both images receive `:v0.1.0`; their revision labels and summaries record the
+tagged commit, not the workflow's `main` commit. Lightweight and annotated tags
+are supported. The tag must exist and be a valid Docker tag (at most 128
+characters, without slashes). The tagged source must contain the Dockerfiles and required runtime fixes,
+including the vLLM 0.30.0 pin for releases that require that version. The workflow
+does not patch the tagged source or override its dependency versions.
+A manual run on `internal` can also supply a tag to publish development images.
+
+Each image tag points to a multi-platform index containing both architectures;
+Docker selects the appropriate image when pulling. The workflow verifies both
+platforms in the published index and records that index's digest in the summary.
+QEMU is installed before Buildx to compile and run build checks for the non-native
+architecture. Emulated Rust compilation can be slow; jobs allow up to six hours.
+
+Set `MODELEXPRESS_RELEASE_RUNNER` to a Docker-capable Linux runner label that
+permits privileged containers for QEMU/binfmt registration and has sufficient disk
+for both architectures' vLLM base images and Rust builds. The fallback is
+`ubuntu-latest`; its available disk may be insufficient for the runtime build.
+Each run writes full tags and immutable digest references to its job summaries:
+
+- `artifacts.coreweave.com/cw-modelexpress-oci-dev-local/modelexpress-server:<tag>`
+- `artifacts.coreweave.com/cw-modelexpress-oci-dev-local/modelexpress-vllm-runtime:<tag>`
+
+Production uses `cw-modelexpress-oci-prod-local`. Treat release tags as immutable:
+do not move or reuse them for changed builds. Artifactory may reject a retry that
+produces a different digest for an existing production tag. Untagged development
+builds use the full source SHA, run ID, and attempt number.
+Deploy using the recorded `@sha256:...` references.
