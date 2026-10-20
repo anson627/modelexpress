@@ -175,6 +175,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
     ),
+    # Install a delta by reloading only the modules it changes.
+    "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
+        "MX_REFIT_DELTA_SURGICAL",
+    ),
     "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
         "MX_REFIT_FULL_STREAMING",
@@ -183,11 +188,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(
         int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
         "MX_REFIT_STREAM_WINDOW_LAYERS",
-    ),
-    # Install a delta by reloading only the modules it changes.
-    "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
-        os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
-        "MX_REFIT_DELTA_SURGICAL",
     ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
