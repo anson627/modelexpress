@@ -2565,6 +2565,7 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
     monkeypatch.setenv("MX_MS_DISTRIBUTED", "1")
     monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", window_layers)
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
 
     paths = []
 
@@ -2668,4 +2669,28 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     assert torch.equal(model.weight, torch.tensor([7.0, 8.0]))
     assert stream._writer is None
     assert stream._complete
+    assert installer._live_version == "v2"
     assert paths == ["vllm" if window_layers == "0" else "windowed"]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_reload_preserves_registered_buffer_storage_after_deferred_hook(monkeypatch, persistent):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    model = nn.Module()
+    model.register_buffer("scale_inv", torch.ones(1), persistent=persistent)
+    registered = model.scale_inv
+    pointer = registered.data_ptr()
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def finalize(target, _config):
+        target.register_buffer("scale_inv", torch.full((1,), 4.0), persistent=persistent)
+
+    layerwise.finalize_layerwise_reload = finalize
+    installer = _VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+    )
+    installer._reload(lambda _aliases: None)
+    assert model.scale_inv is registered
+    assert model.scale_inv.data_ptr() == pointer
+    assert registered.item() == 4.0
+    assert ("scale_inv" in model.state_dict()) is persistent

@@ -1276,7 +1276,12 @@ Before a reload, the installer restores registered slots for live kernel buffers
 that were created after vLLM recorded its load-time metadata. PWAL can then
 replace those buffers without turning them into conflicting plain attributes,
 and vLLM's normal finalizer copies them back into their original graph-bound
-storage.
+storage. Deferred post-load hooks can also replace registered device buffers,
+including MLA's `_q_scale_inv` and `_k_scale_inv`. The installer snapshots both
+bare device tensors and registered buffers before reload, then copies updated
+values into the original storage and restores tensor identity after finalization.
+This preserves addresses used by captured graphs and ModelExpress registrations,
+including persistent and nonpersistent buffers and their `state_dict` membership.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
 backend for both paths. An empty initialization payload preserves the existing
@@ -1387,6 +1392,12 @@ validated source manifests change; an incompatible destination staging layout
 requires an engine restart.
 
 ### Experimental streamed full refit
+
+Streamed refit requires `runai-model-streamer>=0.17.0` for ranged window reads.
+For S3-compatible storage, configure matching `AWS_ENDPOINT_URL` and
+`AWS_DEFAULT_REGION` on every generator worker. The generator's
+`object_storage_endpoint_url` and `object_storage_region_name` configure the
+`S3Client` index read; shard reads use RunAI's separate configuration.
 
 With `MX_REFIT_FULL_STREAMING=true`, vLLM can stream a new, non-checksummed full
 HF checkpoint directly from indexed S3 shards through its existing graph-safe
@@ -1730,7 +1741,9 @@ agent.release_xfer_handle(handle)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
-The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers any accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout, receives the real data via RDMA, and all state (including hidden quant config tensors) is correct.
+The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
+
+Hidden-tensor adoption skips the exact `vllm.models.kimi_k3.nvidia.ops.latent_moe_tail.KimiK3LatentMoETailOp` class. Its GPU peer-pointer arrays, barriers, and multicast workspaces are process-local collective state and must retain the receiver's allocations and contents. Transferring donor collective state can cause CUDA illegal-address errors during receiver warmup. Hidden quantization tensors outside this operator remain eligible for adoption and RDMA transfer.
 
 ```mermaid
 graph TD

@@ -117,9 +117,9 @@ class PreparedCheckpoint:
     target_version: str
     path: Path
     metrics: dict[str, float]
-    streaming: StreamedCheckpoint | None = None
     # Deltas from the target's full root, oldest first; empty when unknown.
     delta_changes: tuple[DeltaChange, ...] = ()
+    streaming: StreamedCheckpoint | None = None
     # Nonzero XOR bytes from ``staging_base`` to the target, when staged.
     staging: Path | None = None
     staging_base: str | None = None

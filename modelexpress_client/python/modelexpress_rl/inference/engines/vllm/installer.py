@@ -42,10 +42,6 @@ from modelexpress.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
-from modelexpress_rl.inference.engines.vllm.stream_windows import (
-    layer_windows,
-    windowed_weights,
-)
 from modelexpress_rl.inference.engines.vllm.inplace import (
     InPlaceInstaller,
     InPlaceUnsupported,
@@ -57,6 +53,10 @@ from modelexpress_rl.inference.staging import StagedDelta
 from modelexpress_rl.inference.engines.vllm.surgical import (
     changed_since,
     module_groups,
+)
+from modelexpress_rl.inference.engines.vllm.stream_windows import (
+    layer_windows,
+    windowed_weights,
 )
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
@@ -1615,8 +1615,8 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
-        # Layerwise reload does not save bare device tensors referenced by
-        # captured graphs. Host bookkeeping follows the native reload lifecycle.
+        # Deferred post-load hooks can replace bare tensors and registered buffers.
+        # Preserve both for graph consumers and ModelExpress tensor registrations.
         def geometry(tensor):
             return (
                 tuple(tensor.shape),
@@ -1632,7 +1632,7 @@ class _VllmInstaller(EngineInstaller):
                 module,
                 {
                     name: (value, geometry(value))
-                    for name, value in module.__dict__.items()
+                    for name, value in {**module.__dict__, **module._buffers}.items()
                     if isinstance(value, torch.Tensor)
                     and value.device.type == self._device.type
                     and (
@@ -1666,7 +1666,7 @@ class _VllmInstaller(EngineInstaller):
                         f"graph-bound tensor owner {path!r} was replaced"
                     )
                 for name, (graph_tensor, original_geometry) in attributes.items():
-                    current = module.__dict__.get(name)
+                    current = getattr(module, name, None)
                     if (
                         not isinstance(current, torch.Tensor)
                         or geometry(graph_tensor) != original_geometry
