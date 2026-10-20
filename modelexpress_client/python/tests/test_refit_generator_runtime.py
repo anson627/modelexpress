@@ -444,7 +444,7 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
     arena = torch.ones(2)
     closed = []
     transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
-    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=lambda manifest: None)
     prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
     prepared.ownership.iterator = iter(({"weight": arena},))
     if failure != "in_progress":
@@ -470,3 +470,57 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
         assert method._active_streamed is prepared
         assert prepared.ownership.iterator is not None
         assert transfer.arena is arena
+
+
+@pytest.mark.parametrize(
+    "setting,capability,argument",
+    [
+        ("MX_REFIT_FULL_STREAMING", "streamed_checkpoints", "stream_full_checkpoints"),
+        ("MX_REFIT_INPLACE", "staged_checkpoints", "staged_checkpoints"),
+    ],
+)
+@pytest.mark.parametrize(
+    "enabled,supported,expected",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_checkpoint_modes_require_opt_in_and_engine_capability(
+    monkeypatch, tmp_path, setting, capability, argument, enabled, supported, expected
+):
+    from dataclasses import replace
+    from unittest.mock import Mock
+    from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
+
+    monkeypatch.setenv(setting, str(enabled))
+    engine = _full_tensor_engine()
+    installer = Mock(
+        capabilities=EngineCapabilities(
+            artifact_types=frozenset({PreparedCheckpointArtifact}),
+            **{capability: supported},
+        )
+    )
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda context: replace(engine, installer=installer),
+    )
+    canonical = _Method({WeightSource.OBJECT_STORAGE})
+    constructor = Mock(return_value=canonical)
+    monkeypatch.setattr(runtime_module, "CanonicalDeltaUpdateMethod", constructor)
+    runtime = initialize_generator_runtime(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-0",
+        server_url="mx:8000",
+        object_storage=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v0",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        source_order=(WeightSource.OBJECT_STORAGE,),
+        max_transfer_attempts=1,
+        rpc_timeout_seconds=30,
+        service=lambda: object(),
+        start_lease=lambda version: object(),
+    )
+    assert constructor.call_args.kwargs[argument] is expected
+    runtime.close()

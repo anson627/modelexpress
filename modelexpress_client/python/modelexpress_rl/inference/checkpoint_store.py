@@ -53,6 +53,15 @@ def _copy_checkpoint_file(source: str, destination: str) -> str:
     return shutil.copy2(source, destination)
 
 
+# A prefetcher polls as soon as this file's modification time changes.
+PREFETCH_TRIGGER_FILE = "prefetch.trigger"
+
+# Temporary directories are named this prefix and 32 hex digits, which only
+# initialization's cleanup matches.
+_TEMPORARY_PREFIX = ".checkpoint-"
+_TEMPORARY_PATTERN = _TEMPORARY_PREFIX + "[0-9a-f]" * 32
+
+
 def _encode_cache_component(value: str) -> str:
     """Encode an opaque ID as exactly one filesystem path component."""
     # quote() never escapes dots, even with safe="". Encode dot-only IDs
@@ -63,9 +72,15 @@ def _encode_cache_component(value: str) -> str:
 
 
 class CheckpointState(str, Enum):
-    """Preparation state persisted across receiver processes."""
+    """Preparation state persisted across receiver processes.
+
+    ``STAGED`` means the target's delta is verified and staged, while the
+    checkpoint files still hold an earlier version, the record's ``base``. The
+    deltas between them in the target's chain are staged too.
+    """
 
     READY = "READY"
+    STAGED = "STAGED"
     UPDATING = "UPDATING"
 
 
@@ -77,6 +92,8 @@ class CheckpointRecord:
     version: str
     files: dict[str, list[int]] | None = None
     source: dict[str, str] | None = None
+    # The earlier version whose bytes the checkpoint files hold, when STAGED.
+    base: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict | None) -> CheckpointRecord | None:
@@ -88,16 +105,25 @@ class CheckpointRecord:
             return None
         files = value.get("files")
         source = value.get("source")
+        base = value.get("base")
         if files is not None and not isinstance(files, dict):
             return None
         if source is not None and not isinstance(source, dict):
+            return None
+        if (status is CheckpointState.STAGED) != isinstance(base, str):
             return None
         return cls(
             status=status,
             version=value["version"],
             files=files,
             source=source,
+            base=base,
         )
+
+    @property
+    def files_version(self) -> str:
+        """The version whose bytes the checkpoint files hold."""
+        return self.base if self.base is not None else self.version
 
     def to_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -108,6 +134,8 @@ class CheckpointRecord:
             value["files"] = self.files
         if self.source is not None:
             value["source"] = self.source
+        if self.base is not None:
+            value["base"] = self.base
         return value
 
 
@@ -155,7 +183,11 @@ class LocalCheckpointStore:
         #     deltas/<version>/         immutable delta index and shards
         #     chains/<version>.json     full ancestor plus ordered deltas
         #     materialized/<version>/   derived, installable full checkpoints
+        #     staging/<version>/        derived nonzero XOR bytes of one delta
+        #     checksums/<version>.json  verified Adler-32 of a version's tensors
         #     state.json                current preparation transaction
+        #     speculation.json          unregistered target being prepared ahead
+        #     want.json                 target an engine waits to prepare
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
         #     .prepare.lock             serializes preparation requests
@@ -171,8 +203,12 @@ class LocalCheckpointStore:
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
         self.materialized_cache = self.cache / "materialized"
+        self.staging_cache = self.cache / "staging"
+        self.checksum_cache = self.cache / "checksums"
         self.state_path = self.cache / "state.json"
+        self.speculation_path = self.cache / "speculation.json"
         self.active_path = self.cache / "active.json"
+        self.want_path = self.cache / "want.json"
         self.lock_path = self.cache / ".lock"
         self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
@@ -185,10 +221,21 @@ class LocalCheckpointStore:
             self.delta_cache,
             self.chain_cache,
             self.materialized_cache,
+            self.staging_cache,
+            self.checksum_cache,
         ):
             path.mkdir(exist_ok=True)
 
-        with self.locked(shared=True):
+        with self.locked():
+            for root in (
+                self.full_cache,
+                self.delta_cache,
+                self.materialized_cache,
+                self.staging_cache,
+            ):
+                for temporary in root.glob(_TEMPORARY_PATTERN):
+                    logger.info("Removing interrupted checkpoint write %s", temporary)
+                    shutil.rmtree(temporary, ignore_errors=True)
             free_bytes = shutil.disk_usage(self.cache).free
             disk_limit = self.cache_size_bytes() + free_bytes
             if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
@@ -224,8 +271,12 @@ class LocalCheckpointStore:
         *,
         copy_from: Path | None = None,
     ) -> Iterator[Path]:
-        """Populate a temporary directory and promote it to ``target``."""
-        temporary = target.with_name(f".checkpoint-{uuid.uuid4().hex}")
+        """Populate a temporary directory and promote it to ``target``.
+
+        Callers hold the exclusive cache lock, so initialization can remove a
+        temporary directory that a stopped process left.
+        """
+        temporary = target.with_name(f"{_TEMPORARY_PREFIX}{uuid.uuid4().hex}")
         temporary.mkdir(parents=True)
         try:
             if copy_from is not None:
@@ -254,8 +305,30 @@ class LocalCheckpointStore:
     def materialized_path(self, version: str) -> Path:
         return self._version_path(self.materialized_cache, version)
 
+    def staging_path(self, version: str) -> Path:
+        return self._version_path(self.staging_cache, version)
+
     def chain_path(self, version: str) -> Path:
         return self.chain_cache / f"{_encode_cache_component(version)}.json"
+
+    def checksums_path(self, version: str) -> Path:
+        return self.checksum_cache / f"{_encode_cache_component(version)}.json"
+
+    def checksums(self, version: str) -> dict[str, str]:
+        """Verified checksums of a version's tensors, as far as they are known."""
+        table = self._read_json(self.checksums_path(version)) or {}
+        return {name: value for name, value in table.items() if isinstance(value, str)}
+
+    def write_checksums(
+        self, version: str, table: dict[str, str], *, keep: Iterable[str] = ()
+    ) -> None:
+        """Record a version's verified checksums, dropping other versions' not in ``keep``."""
+        self.checksum_cache.mkdir(exist_ok=True)
+        self._write_json(self.checksums_path(version), table)
+        kept = {self.checksums_path(name).name for name in (version, *keep)}
+        for path in self.checksum_cache.glob("*.json"):
+            if path.name not in kept:
+                path.unlink(missing_ok=True)
 
     @staticmethod
     def path_size_bytes(path: Path) -> int:
@@ -284,6 +357,7 @@ class LocalCheckpointStore:
                 self.full_cache,
                 self.delta_cache,
                 self.materialized_cache,
+                self.staging_cache,
             )
         )
 
@@ -296,6 +370,7 @@ class LocalCheckpointStore:
                     self.full_path(version),
                     self.delta_path(version),
                     self.materialized_path(version),
+                    self.staging_path(version),
                 }
             )
             chain = self.chain(version)
@@ -313,6 +388,7 @@ class LocalCheckpointStore:
 
     def _eviction_candidates(self, protected: set[Path]) -> list[Path]:
         groups = (
+            self.staging_cache,
             self.materialized_cache,
             self.delta_cache,
             self.full_cache,
@@ -422,18 +498,102 @@ class LocalCheckpointStore:
         version: str,
         checkpoint_paths: Iterable[Path],
         source: dict[str, str] | None = None,
-    ) -> None:
+        base: str | None = None,
+    ) -> CheckpointRecord:
         state = CheckpointRecord(
             status=status,
             version=version,
             files=(
                 checkpoint_files_state(checkpoint_paths)
-                if status is CheckpointState.READY
+                if status is not CheckpointState.UPDATING
                 else None
             ),
             source=source,
+            base=base,
         )
         self._write_json(self.state_path, state.to_dict())
+        return state
+
+    def wanted(self) -> dict | None:
+        """Return the target an engine waits to prepare, if any."""
+        return self._read_json(self.want_path)
+
+    def write_wanted(self, value: dict[str, object]) -> None:
+        try:
+            self._write_json(self.want_path, value)
+        except OSError:
+            logger.debug("want record is unavailable", exc_info=True)
+
+    def clear_wanted(self) -> None:
+        self.want_path.unlink(missing_ok=True)
+
+    def notify_prefetcher(self) -> None:
+        """Ask a running prefetcher to poll now instead of at its next interval."""
+        try:
+            (self.cache / PREFETCH_TRIGGER_FILE).touch()
+        except OSError:
+            logger.debug("prefetch trigger is unavailable", exc_info=True)
+
+    def speculation(self) -> dict | None:
+        """Return the unregistered target prepared ahead of its registration."""
+        return self._read_json(self.speculation_path)
+
+    def write_speculation(
+        self,
+        *,
+        version: str,
+        uri: str,
+        base_version: str,
+        base_source: dict[str, str] | None,
+    ) -> None:
+        self._write_json(
+            self.speculation_path,
+            {
+                "version": version,
+                "uri": uri,
+                "base_version": base_version,
+                "base_source": base_source,
+            },
+        )
+
+    def clear_speculation(self) -> None:
+        self.speculation_path.unlink(missing_ok=True)
+
+    def rename_version(self, old: str, new: str) -> None:
+        """Move one version's artifacts and chain references to another ID.
+
+        Callers hold the exclusive cache lock and own the state transition.
+        """
+        for path_for in (
+            self.full_path,
+            self.delta_path,
+            self.materialized_path,
+            self.staging_path,
+        ):
+            source, target = path_for(old), path_for(new)
+            if source.exists():
+                shutil.rmtree(target, ignore_errors=True)
+                source.replace(target)
+        for chain_file in sorted(self.chain_cache.glob("*.json")):
+            chain = self._read_json(chain_file)
+            if chain is None:
+                continue
+            renamed = dict(chain)
+            for key in ("version", "full_version"):
+                if renamed.get(key) == old:
+                    renamed[key] = new
+            if isinstance(renamed.get("deltas"), list):
+                renamed["deltas"] = [
+                    new if delta == old else delta for delta in renamed["deltas"]
+                ]
+            if renamed != chain:
+                self._write_json(chain_file, renamed)
+        old_chain = self.chain_path(old)
+        if old_chain.exists():
+            old_chain.replace(self.chain_path(new))
+        old_checksums = self.checksums_path(old)
+        if old_checksums.exists():
+            old_checksums.replace(self.checksums_path(new))
 
     def chain(self, version: str) -> dict | None:
         return self._read_json(self.chain_path(version))
@@ -504,6 +664,7 @@ class LocalCheckpointStore:
 
 
 __all__ = [
+    "PREFETCH_TRIGGER_FILE",
     "CheckpointCacheCapacityError",
     "CheckpointRecord",
     "CheckpointState",

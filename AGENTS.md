@@ -70,7 +70,13 @@ Load the matching skill before starting any of these. Each is a `SKILL.md` under
 
 ## Git Workflow
 
-Feature branches use `<username>/feature-name` format, forked from `main`.
+Feature branches use `<username>/feature-name` format, forked from `internal`.
+
+### Pull requests
+
+- Target `internal` by default. In this fork, `main` mirrors upstream `ai-dynamo/modelexpress` through sync PRs.
+- GitHub and `gh` default to `main`, so name the base: `gh pr create --base internal`, and `--base internal` for `gh stack init` and `gh stack link`.
+- In a stack, only the bottom PR targets `internal`; each PR above it targets the branch of the PR below.
 
 ### Commits and DCO
 

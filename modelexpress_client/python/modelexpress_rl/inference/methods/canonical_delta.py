@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 
 from ...control import WeightVersion
@@ -25,7 +27,11 @@ from ..receiver import (
     _LocalCheckpoint,
     _S3Version,
     bootstrap_s3_checkpoint,
+    _parse_index_manifest,
+    PreparedCheckpoint,
 )
+
+from ..streaming_checkpoint import StreamedCheckpoint
 
 
 class CanonicalDeltaUpdateMethod(UpdateMethod):
@@ -36,6 +42,8 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         *,
         model_name: str,
         config: ObjectStorageGeneratorConfig,
+        stream_full_checkpoints: bool = False,
+        staged_checkpoints: bool = False,
     ) -> None:
         if config.storage_type is not ObjectStorageType.S3:
             raise ValueError("only S3 object storage is currently supported")
@@ -50,6 +58,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 model_name=model_name,
                 config=config,
                 s3=self._s3,
+                stage_deltas=staged_checkpoints,
             )
             self._initialized = self._checkpoint.initialize(
                 allow_unrecorded_seed=True,
@@ -58,10 +67,37 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             self._s3.close()
             raise
         self._active: PreparedCheckpointArtifact | None = None
+        self._stream_full_checkpoints = stream_full_checkpoints
+        self._staged_checkpoints = staged_checkpoints
+        self._streams: list[StreamedCheckpoint] = []
+
+    @property
+    def model_name(self) -> str:
+        """Name keying this method's host checkpoint cache."""
+        return self._model_name
+
+    @property
+    def staged_checkpoints(self) -> bool:
+        """Whether preparations may leave a delta staged on its base's files."""
+        return self._staged_checkpoints
+
+    @property
+    def stream_full_checkpoints(self) -> bool:
+        """Whether full checkpoints stream into the engine as it installs them."""
+        return self._stream_full_checkpoints
 
     @property
     def requires_full_root(self) -> bool:
         return not self._initialized
+
+    def is_prepared(self, version: WeightVersion) -> bool:
+        """Return whether the local cache head already holds ``version``."""
+        if not self._initialized or version.object_storage is None:
+            return False
+        return self._checkpoint.is_prepared(
+            version_id=version.version_id,
+            uri=version.object_storage.uri,
+        )
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -90,38 +126,92 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
     ) -> PreparedArtifact:
         if self._active is not None:
             raise RuntimeError("release staged weight before staging another version")
+        self._streams = [stream for stream in self._streams if not stream.cache_succeeded]
         versions = [self._version(version, source) for version, source in chain]
         try:
-            if not self._initialized:
-                if (
-                    not versions
-                    or versions[0].payload_format
-                    is not WeightPayloadFormat.FULL_HF_CHECKPOINT
-                ):
-                    raise RuntimeError(
-                        "S3 fallback without a cached seed requires a full replay root"
+            checkpoint = None
+            if (
+                self._stream_full_checkpoints
+                and self._initialized
+                and len(versions) == 1
+                and versions[0].payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+            ):
+                version = versions[0]
+                started = time.perf_counter()
+                index_data = self._s3.get(version.uri)
+                metadata, weight_map = _parse_index_manifest(index_data, is_delta=False)
+                if "checksum_format" not in metadata:
+                    if set(weight_map) != set(self._checkpoint.tensor_metadata):
+                        raise ValueError(
+                            "full HF checkpoint tensor set differs from local checkpoint"
+                        )
+                    stream = StreamedCheckpoint(
+                        version=version,
+                        index_data=index_data,
+                        weight_map=weight_map,
+                        tensor_metadata=self._checkpoint.tensor_metadata,
+                        store=self._checkpoint.store,
                     )
-                root = versions[0]
-                seed = bootstrap_s3_checkpoint(
-                    model_name=self._model_name,
-                    version=root,
-                    refit_checkpoint_dir=self._config.refit_checkpoint_dir,
-                    refit_checkpoint_max_size_gb=self._config.refit_checkpoint_max_size_gb,
-                    s3=self._s3,
+                    self._streams.append(stream)
+                    checkpoint = PreparedCheckpoint(
+                        target_version=version.version_id,
+                        path=self._checkpoint.store.full_path(version.version_id),
+                        metrics={
+                            "perf/mx_receive_prepare_time": time.perf_counter()
+                            - started
+                        },
+                        streaming=stream,
+                    )
+            if checkpoint is None:
+                streams, self._streams = self._streams, []
+                cache_error = None
+                for stream in streams:
+                    try:
+                        stream.wait_cache()
+                    except Exception as error:
+                        if cache_error is None:
+                            cache_error = error
+                if cache_error is not None:
+                    raise RuntimeError(
+                        "streamed full checkpoint cache failed"
+                    ) from cache_error
+                if not self._initialized:
+                    if (
+                        not versions
+                        or versions[0].payload_format
+                        is not WeightPayloadFormat.FULL_HF_CHECKPOINT
+                    ):
+                        raise RuntimeError(
+                            "S3 fallback without a cached seed requires a full replay root"
+                        )
+                    root = versions[0]
+                    seed = bootstrap_s3_checkpoint(
+                        model_name=self._model_name,
+                        version=root,
+                        refit_checkpoint_dir=self._config.refit_checkpoint_dir,
+                        refit_checkpoint_max_size_gb=self._config.refit_checkpoint_max_size_gb,
+                        s3=self._s3,
+                    )
+                    checkpoint = _LocalCheckpoint(
+                        model_name=self._model_name,
+                        config=replace(
+                            self._config,
+                            initial_base_version_id=root.version_id,
+                            seed_checkpoint_path=seed,
+                        ),
+                        s3=self._s3,
+                        stage_deltas=self._staged_checkpoints,
+                    )
+                    checkpoint.initialize()
+                    self._checkpoint = checkpoint
+                    self._initialized = True
+                started = time.perf_counter()
+                checkpoint = self._checkpoint.prepare_chain(
+                    tuple(versions), staged=self._staged_checkpoints
                 )
-                checkpoint = _LocalCheckpoint(
-                    model_name=self._model_name,
-                    config=replace(
-                        self._config,
-                        initial_base_version_id=root.version_id,
-                        seed_checkpoint_path=seed,
-                    ),
-                    s3=self._s3,
+                checkpoint.metrics["perf/mx_receive_prepare_time"] = (
+                    time.perf_counter() - started
                 )
-                checkpoint.initialize()
-                self._checkpoint = checkpoint
-                self._initialized = True
-            checkpoint = self._checkpoint.prepare_chain(tuple(versions))
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
@@ -149,6 +239,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             uri=storage.uri,
         )
 
+    @contextmanager
     def installation_context(
         self,
         prepared: PreparedArtifact,
@@ -158,10 +249,19 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         """Install a prepared checkpoint and optionally activate it afterward."""
         if prepared is not self._active:
             raise RuntimeError("canonical checkpoint is no longer active")
-        return self._checkpoint.installation_context(
-            prepared.checkpoint,
-            activate=activate,
-        )
+        stream = prepared.checkpoint.streaming
+        if stream is not None:
+            try:
+                yield
+                stream.finish_cache(success=True, activate=activate)
+            except BaseException:
+                stream.finish_cache(success=False)
+                raise
+        else:
+            with self._checkpoint.installation_context(
+                prepared.checkpoint, activate=activate
+            ):
+                yield
 
     def preparation_failed(self) -> None:
         if self._initialized:
@@ -171,7 +271,10 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         """Activate the prepared checkpoint after distributed loading succeeds."""
         if prepared is not self._active:
             raise RuntimeError("canonical checkpoint is no longer active")
-        self._checkpoint.activate(prepared.checkpoint)
+        if prepared.checkpoint.streaming is None:
+            self._checkpoint.activate(prepared.checkpoint)
+        else:
+            prepared.checkpoint.streaming.activate_cache()
 
     def release(self, prepared: PreparedArtifact) -> None:
         if prepared is not self._active:
@@ -180,6 +283,9 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
 
     def close(self) -> None:
         self._active = None
+        for stream in self._streams:
+            stream.close()
+        self._streams.clear()
         self._s3.close()
 
 

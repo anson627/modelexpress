@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import threading
 import time
 import uuid
@@ -27,7 +29,10 @@ from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
+from .checkpoint_store import LocalCheckpointStore
+from .methods.canonical_delta import CanonicalDeltaUpdateMethod
 from .plan import WeightSource, parse_weight_source_order
+from .prefetch import PrefetchSettings, launch_prefetcher
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -257,6 +262,8 @@ class ModelExpressGeneratorClient:
         self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
+        self._prefetcher: subprocess.Popen | None = None
+        self._prefetch_store: LocalCheckpointStore | None = None
         self._closed = False
 
     @classmethod
@@ -324,6 +331,11 @@ class ModelExpressGeneratorClient:
             )
             if client._serving_version_id is not None:
                 client._validate_initial_serving_version(client._serving_version_id)
+                # The engine holds this version's bytes, so the first delta from it
+                # can install without a full reload.
+                record_live = getattr(runtime.engine.installer, "record_live_version", None)
+                if record_live is not None:
+                    record_live(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,
@@ -335,10 +347,75 @@ class ModelExpressGeneratorClient:
             except Exception:
                 client._registration_thread = None
                 raise
+            if (
+                config.object_storage is not None
+                and rl_envs.MX_REFIT_PREFETCH
+                and rl_envs.LOCAL_RANK in (None, 0)
+            ):
+                client._start_prefetcher(config.object_storage)
         except Exception:
             client.close()
             raise
         return client
+
+    def notify_prefetch(self) -> None:
+        """Ask the host prefetcher to look for new versions now."""
+        if self._prefetch_store is not None:
+            self._prefetch_store.notify_prefetcher()
+
+    def _start_prefetcher(self, object_storage: ObjectStorageGeneratorConfig) -> None:
+        canonical = next(
+            (
+                method
+                for method in self._require_runtime().methods
+                if isinstance(method, CanonicalDeltaUpdateMethod)
+            ),
+            None,
+        )
+        if canonical is None:
+            return
+        settings = PrefetchSettings(
+            model_name=self.model_name,
+            cache_model_name=canonical.model_name,
+            server_url=self.server_url,
+            refit_checkpoint_dir=str(object_storage.refit_checkpoint_dir),
+            initial_base_version_id=object_storage.initial_base_version_id,
+            seed_checkpoint_path=(
+                None
+                if object_storage.seed_checkpoint_path is None
+                else str(object_storage.seed_checkpoint_path)
+            ),
+            refit_checkpoint_max_size_gb=object_storage.refit_checkpoint_max_size_gb,
+            endpoint_url=object_storage.endpoint_url,
+            region_name=object_storage.region_name,
+            max_replay_chain_length=self._max_replay_chain_length,
+            rpc_timeout_seconds=self._rpc_timeout_seconds,
+            s3_watch=rl_envs.MX_REFIT_PREFETCH_S3_WATCH,
+            parent_pid=os.getpid(),
+            staged=canonical.staged_checkpoints,
+            streamed=canonical.stream_full_checkpoints,
+        )
+        self._prefetch_store = settings.store()
+        # One process per host cache; extra co-located ranks exit at once.
+        self._prefetcher = launch_prefetcher(
+            settings, workers=rl_envs.MX_REFIT_PREFETCH_WORKERS
+        )
+        logger.info(
+            "ModelExpress refit prefetch started pid=%s cache=%s s3_watch=%s",
+            self._prefetcher.pid,
+            self._prefetch_store.cache,
+            settings.s3_watch,
+        )
+
+    def _stop_prefetcher(self) -> None:
+        prefetcher, self._prefetcher = self._prefetcher, None
+        if prefetcher is None or prefetcher.poll() is not None:
+            return
+        prefetcher.terminate()
+        try:
+            prefetcher.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            prefetcher.kill()
 
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
         """Prepare an exact version without installing it into the live engine.
@@ -479,6 +556,7 @@ class ModelExpressGeneratorClient:
         """Stop renewal and release control-plane and adapter resources."""
         if self._closed:
             return
+        self._stop_prefetcher()
         with self._operation_lock:
             if self._active_handle is not None:
                 self._release_staged(self._active_handle)

@@ -233,6 +233,44 @@ def _select_draft_weight_files(
         return DraftShardSelection.UNRESOLVED, []
 
 
+def _own_buffered_indexer_tensors(
+    weights: Iterator[tuple[str, torch.Tensor]],
+    recorded: dict[str, torch.Tensor],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Copy and record FP8 indexer wk tensors, which vLLM pairs across calls.
+
+    Streaming iterators may yield views into reused read buffers.
+    """
+    for name, tensor in weights:
+        if ".indexer.wk." in name:
+            tensor = tensor.clone()
+            recorded[name] = tensor
+        yield name, tensor
+
+
+def _rewrite_indexer_wk_pairs(model: torch.nn.Module, recorded: dict[str, torch.Tensor]) -> None:
+    """Feed each streamed FP8 indexer wk weight again together with its scale.
+
+    vLLM writes the fused ``wk_weights_proj`` shard only once both halves are
+    buffered together, so a half the stream stranded would leave it unwritten.
+    """
+    pending = getattr(model, "_pending_indexer_wk_fp8", None)
+    if pending:
+        logger.warning("Rewriting FP8 indexer wk pairs left pending by the stream: %s", sorted(pending))
+        pending.clear()
+    pairs: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+    for name, tensor in recorded.items():
+        prefix = name.rsplit(".wk.", 1)[0]
+        pairs.setdefault(prefix, {})["scale" if "weight_scale" in name else "weight"] = (name, tensor)
+    incomplete = sorted(prefix for prefix, parts in pairs.items() if len(parts) != 2)
+    if incomplete:
+        raise RuntimeError(f"the stream lacks an FP8 indexer wk weight or scale: {incomplete}")
+    if pairs:
+        model.load_weights(item for _prefix, parts in sorted(pairs.items()) for item in parts.values())
+    if getattr(model, "_pending_indexer_wk_fp8", None):
+        raise RuntimeError("FP8 indexer wk pairs remain pending after the rewrite")
+
+
 class VllmAdapter(EngineAdapter):
     """Adapter that maps strategy hooks onto vLLM's native loader APIs."""
 
@@ -328,7 +366,13 @@ class VllmAdapter(EngineAdapter):
         result = self._finalize_model_specific_weights(
             result, _VLLM_POST_RDMA_FINALIZER_NAMES
         )
-        return self._refresh_host_quantization_state(result)
+        result = self._refresh_host_quantization_state(result)
+        # Release idle post-processing storage after the receive is complete,
+        # before later loaders (for example an MTP draft) allocate NCCL buffers.
+        # Live tensors, including registered weight storage, stay allocated.
+        self.accelerator_backend.synchronize()
+        self.accelerator_backend.empty_cache()
+        return result
 
     def apply_weight_iter(
         self,
@@ -337,7 +381,9 @@ class VllmAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM weight iterator loading requires result.model")
-        result.model.load_weights(weights_iter)
+        recorded: dict[str, torch.Tensor] = {}
+        result.model.load_weights(_own_buffered_indexer_tensors(weights_iter, recorded))
+        _rewrite_indexer_wk_pairs(result.model, recorded)
         return result
 
     def build_model_streamer_weight_iter(

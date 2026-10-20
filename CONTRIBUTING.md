@@ -16,6 +16,7 @@ For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). 
 - **protoc**: Protocol Buffers compiler
 - **Python 3.10+** (optional): For the P2P client library
 - **C++ compiler** (optional, `g++` or any compiler in `$CXX`): To build the `modelexpress.vmm._alloc_ext` extension that enables the `MX_VMM_ARENA=1` fast path. Without a working compiler the Python install still succeeds and `MX_VMM_ARENA=1` falls back to the pool-reg path at runtime with a warning
+- **zstd development files** (optional, `libzstd-dev` or `libzstd-devel`, found through `pkg-config` when available): With the C++ compiler, to build the `modelexpress_rl.inference._delta_ext` delta checker. Without them the install still succeeds and refit checks deltas in Python
 - **Docker** (optional): For containerized deployment
 - **Redis** (optional): For P2P metadata coordination
 - **pre-commit**: For automated code quality checks

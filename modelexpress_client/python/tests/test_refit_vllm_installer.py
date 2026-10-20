@@ -3,7 +3,9 @@
 
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -12,6 +14,8 @@ from modelexpress.engines.vllm.host_quantization import (
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress_rl.inference.engines.vllm import installer as installer_module
+from modelexpress_rl.inference.engines.vllm.inplace import InPlaceUnsupported
 from modelexpress_rl.inference.engines.vllm.installer import (
     _copy_received,
     _standard_module_access,
@@ -24,7 +28,9 @@ from modelexpress_rl.inference.plan import (
     PreparedRuntimeTensors,
     PreparedStreamingTensors,
 )
-from modelexpress_rl.inference.receiver import PreparedCheckpoint
+from modelexpress_rl.inference.receiver import PreparedCheckpoint, _S3Version
+from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
+from modelexpress_rl.train import WeightPayloadFormat
 from torch import nn
 
 
@@ -86,19 +92,24 @@ def _install_fake_vllm(monkeypatch, initialize):
                     reset=lambda: None,
                 )
 
+    meta = modules["vllm.model_executor.model_loader.reload.meta"]
+
+    def materialize_meta_tensor(value):
+        return torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
+
+    # Like vLLM's, materializes each meta tensor through the module's function.
     def materialize_layer(layer, _info):
         for name, value in (*layer._parameters.items(), *layer._buffers.items()):
             if value is None or not value.is_meta:
                 continue
-            tensor = torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
+            tensor = meta.materialize_meta_tensor(value)
             if name in layer._parameters:
                 tensor = nn.Parameter(tensor, requires_grad=False)
             tensor.__dict__.update(value.__dict__)
             setattr(layer, name, tensor)
 
-    modules[
-        "vllm.model_executor.model_loader.reload.meta"
-    ].materialize_layer = materialize_layer
+    meta.materialize_meta_tensor = materialize_meta_tensor
+    meta.materialize_layer = materialize_layer
     modules["vllm.model_executor.layers.attention"].is_deferred_attention_layer = (
         lambda layer: getattr(layer, "deferred_attention", False)
     )
@@ -602,6 +613,23 @@ def test_reload_rejects_incompatible_graph_bound_tensor(monkeypatch, change):
         installer._reload(lambda _aliases: None)
 
 
+def test_an_in_place_reload_that_stops_partway_fails_the_refit(monkeypatch):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=nn.Module(),
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    def load(_aliases):
+        raise InPlaceUnsupported("processed tensor size differs from live storage")
+
+    # Unlike an in-place install refused before it starts, this one cannot reload.
+    with pytest.raises(IncompleteRefit, match="processed tensor size differs"):
+        installer._reload(load, xor=True)
+
+
 def test_reload_accepts_in_place_engine_post_load(monkeypatch):
     _install_fake_vllm(monkeypatch, lambda _model: None)
     model = nn.Module()
@@ -804,7 +832,8 @@ def test_streaming_rejects_aliasing_source_before_any_batch_copy(monkeypatch):
     assert not prepared.ownership.release_blocked
 
 
-def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch, quantized):
     model = nn.Module()
     model.first = nn.Linear(2, 2, bias=False)
     model.attention = nn.Module()
@@ -874,10 +903,11 @@ def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
     installer = _VllmInstaller(
         model=model,
-        vllm_config=object(),
+        vllm_config=SimpleNamespace(quant_config=object() if quantized else None),
         model_config=object(),
         device=torch.device("cpu"),
     )
+    assert PreparedStreamingTensors in installer.capabilities.artifact_types
     for value in (1, 3, 5):
         events.clear()
 
@@ -2203,7 +2233,13 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
     prepared = transfer_module._PreparedBoundedTransfer(
-        planned, {"w": source}, Transport()
+        planned, {"w": source}, Transport(),
+        transfer_module._SourceBinding(
+            transfer_module._ResolvedSources(
+                {"w": source}, {"source": "source"}, {"source": 0}, {}
+            ),
+            {"source": "source"}, (),
+        ),
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
     transfer._descriptor_cache = None
@@ -2506,6 +2542,135 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
     del model.tied
     with pytest.raises(AttributeError):
         installer._restore_parameter_aliases(aliases)
+
+
+@pytest.mark.parametrize("window_layers", ["0", "2"])
+def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
+    monkeypatch, window_layers
+):
+    events = []
+    _install_fake_vllm(monkeypatch, lambda model: events.append("initialize"))
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.finalize_layerwise_reload = lambda model, config: events.append(
+        "finalize"
+    )
+    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_world_group = lambda: SimpleNamespace(local_rank=1)
+    distributed.get_pipeline_model_parallel_world_size = lambda: 1
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.model_loader.weight_utils", weight_utils
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+    monkeypatch.setenv("MX_MS_DISTRIBUTED", "1")
+    monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", window_layers)
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+
+    paths = []
+
+    def iterator(files, use_tqdm_on_load, is_distributed):
+        paths.append("vllm")
+        assert files == ["s3://bucket/v2/model.safetensors"]
+        assert is_distributed
+        try:
+            events.append("stream")
+            yield "weight", torch.tensor([7.0, 8.0])
+        finally:
+            events.append("close")
+
+    loader_module = ModuleType("vllm.model_executor.model_loader.runai_streamer_loader")
+
+    class StreamerLoader:
+        def __init__(self, config):
+            assert config.model_loader_extra_config == {
+                "memory_limit": 123,
+                "concurrency": 7,
+                "distributed": True,
+            }
+            self._is_distributed = config.model_loader_extra_config["distributed"]
+            events.append("configure")
+
+    loader_module.RunaiModelStreamerLoader = StreamerLoader
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.runai_streamer_loader",
+        loader_module,
+    )
+    weight_utils.runai_safetensors_weights_iterator = iterator
+
+    def windowed(files, windows, *, is_distributed):
+        assert windows == [["weight"]]
+        yield from iterator(files, False, is_distributed)
+        paths[-1] = "windowed"
+
+    monkeypatch.setattr(installer_module, "windowed_weights", windowed)
+    monkeypatch.setattr(
+        installer_module,
+        "layer_windows",
+        lambda names, size: [sorted(names)] if size == 2 else pytest.fail("size"),
+    )
+    model = nn.Module()
+    model.register_parameter(
+        "weight", nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    address = model.weight.data_ptr()
+
+    def load(weights):
+        for name, tensor in weights:
+            events.append("load")
+            model.weight.data.copy_(tensor)
+
+    model.load_weights = load
+    stream = StreamedCheckpoint(
+        version=_S3Version(
+            "v2",
+            None,
+            WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            "s3://bucket/v2/model.safetensors.index.json",
+        ),
+        index_data=b"{}",
+        weight_map={"weight": "model.safetensors"},
+        tensor_metadata={"weight": {"dtype": "F32", "shape": [2], "byte_size": 8}},
+        store=Mock(),
+    )
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=SimpleNamespace(
+            load_config=SimpleNamespace(
+                use_tqdm_on_load=False,
+                model_loader_extra_config={"memory_limit": 123, "concurrency": 7},
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        ),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    installer.install(
+        PreparedCheckpointArtifact(
+            PreparedCheckpoint("v2", Path("/unused"), {}, streaming=stream)
+        )
+    )
+    assert events == [
+        "configure",
+        "initialize",
+        "stream",
+        "load",
+        "close",
+        "finalize",
+        "sync",
+    ]
+    assert installer._vllm_config.load_config.model_loader_extra_config == {
+        "memory_limit": 123,
+        "concurrency": 7,
+    }
+    assert model.weight.data_ptr() == address
+    assert torch.equal(model.weight, torch.tensor([7.0, 8.0]))
+    assert stream._writer is None
+    assert stream._complete
+    assert installer._live_version == "v2"
+    assert paths == ["vllm" if window_layers == "0" else "windowed"]
 
 
 @pytest.mark.parametrize("persistent", [False, True])

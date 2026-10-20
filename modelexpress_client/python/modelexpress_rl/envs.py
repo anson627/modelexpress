@@ -30,9 +30,19 @@ if TYPE_CHECKING:
     MX_REFIT_DESIRED_VERSION_UID: str | None
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
+    MX_REFIT_DELTA_SURGICAL: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_INPLACE: bool
+    MX_REFIT_STAGED_LAYERS: int
+    MX_REFIT_NATIVE_CHECK: bool
+    MX_REFIT_PREFER_PREPARED: bool
+    MX_REFIT_PREFETCH: bool
+    MX_REFIT_PREFETCH_S3_WATCH: bool
+    MX_REFIT_PREFETCH_WORKERS: int
+    MX_REFIT_FULL_STREAMING: bool
+    MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -175,6 +185,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
     ),
+    # Install a delta by reloading only the modules it changes.
+    "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
+        "MX_REFIT_DELTA_SURGICAL",
+    ),
+    "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
+        os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
+        "MX_REFIT_FULL_STREAMING",
+    ),
+    # Decoder layers per streamed full-refit request; 0 streams all at once.
+    "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(
+        int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
+        "MX_REFIT_STREAM_WINDOW_LAYERS",
+    ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
     # them costs a few perf_counter calls and one log line, against a refit
@@ -183,6 +207,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_TIMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_TIMING", "true"),
         "MX_REFIT_TIMING",
+    ),
+    # Background preparation of object-storage refits outside the serving pause.
+    "MX_REFIT_PREFETCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH", "false"),
+        "MX_REFIT_PREFETCH",
+    ),
+    "MX_REFIT_PREFETCH_S3_WATCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH_S3_WATCH", "false"),
+        "MX_REFIT_PREFETCH_S3_WATCH",
+    ),
+    "MX_REFIT_PREFETCH_WORKERS": lambda: positive_int_env(
+        "MX_REFIT_PREFETCH_WORKERS", min(8, os.cpu_count() or 8)
+    ),
+    "MX_REFIT_PREFER_PREPARED": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFER_PREPARED", "false"),
+        "MX_REFIT_PREFER_PREPARED",
+    ),
+    "MX_REFIT_INPLACE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_INPLACE", "false"),
+        "MX_REFIT_INPLACE",
+    ),
+    # Most deltas checked through staged bytes before a preparation writes the
+    # checkpoint files.
+    "MX_REFIT_STAGED_LAYERS": lambda: positive_int_env("MX_REFIT_STAGED_LAYERS", 8),
+    # Check deltas in the C++ extension when it is built.
+    "MX_REFIT_NATIVE_CHECK": lambda: parse_bool(
+        os.environ.get("MX_REFIT_NATIVE_CHECK", "true"),
+        "MX_REFIT_NATIVE_CHECK",
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }
@@ -206,6 +258,13 @@ def require_positive_int(value: int, name: str) -> int:
 def positive_int_env(name: str, default: int) -> int:
     """Read a positive integer while retaining its setting name in errors."""
     return require_positive_int(parse_int(os.environ.get(name, str(default)), name), name)
+
+
+def require_non_negative_int(value: int, name: str) -> int:
+    """Return ``value`` or raise when it is negative."""
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
 
 
 def require_positive_float(value: float, name: str) -> float:
