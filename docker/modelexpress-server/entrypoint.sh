@@ -7,4 +7,4 @@ until redis-cli -h 127.0.0.1 ping | grep -q PONG; do
   sleep 0.1
 done
 
-exec ./modelexpress-server --port "${MODELEXPRESS_PORT}"
+exec ./modelexpress-server --port "${MODEL_EXPRESS_SERVER_PORT:-${MODELEXPRESS_PORT:-8001}}"
