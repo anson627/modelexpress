@@ -2,82 +2,74 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Release container images
-
-on:
+'on':
   push:
-    branches: [internal]
+    branches:
+    - internal
   workflow_dispatch:
     inputs:
       release_tag:
         description: Existing Git tag to publish (required for production)
         required: false
         type: string
-
 permissions:
   contents: read
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-
 jobs:
   resolve-source:
-    if: >-
-      github.repository == 'coreweave/modelexpress' &&
-      github.ref_type == 'branch' &&
-      (github.ref_name == 'internal' || github.ref_name == github.event.repository.default_branch)
+    if: github.repository == 'coreweave/modelexpress' && github.ref_type == 'branch' && (github.ref_name == 'internal' ||
+      github.ref_name == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       image-tag: ${{ steps.source.outputs.image-tag }}
     steps:
-      - name: Validate source selection
-        id: selection
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "$RELEASE_TAG" ]]; then
-            if [[ ! "$RELEASE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] ||
-               ! git check-ref-format "refs/tags/$RELEASE_TAG"; then
-              echo '::error::Release tag must be a valid Git tag and Docker image tag (maximum 128 characters).'
-              exit 1
-            fi
-            echo "ref=refs/tags/$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
-            echo '::error::Production releases require an existing release_tag.'
+    - name: Validate source selection
+      id: selection
+      env:
+        RELEASE_TAG: ${{ inputs.release_tag }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -n "$RELEASE_TAG" ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] ||
+             ! git check-ref-format "refs/tags/$RELEASE_TAG"; then
+            echo '::error::Release tag must be a valid Git tag and Docker image tag (maximum 128 characters).'
             exit 1
-          else
-            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Resolve tagged source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          ref: ${{ steps.selection.outputs.ref }}
-          persist-credentials: false
-
-      - name: Record source commit and image tag
-        id: source
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          sha=$(git rev-parse 'HEAD^{commit}')
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          if [[ -n "$RELEASE_TAG" ]]; then
-            echo "image-tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          else
-            echo "image-tag=sha-$sha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          fi
-
-  publish:
+          echo "ref=refs/tags/$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+        elif [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+          echo '::error::Production releases require an existing release_tag.'
+          exit 1
+        else
+          echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Resolve tagged source
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ steps.selection.outputs.ref }}
+        persist-credentials: false
+    - name: Record source commit and image tag
+      id: source
+      env:
+        RELEASE_TAG: ${{ inputs.release_tag }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        sha=$(git rev-parse 'HEAD^{commit}')
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        if [[ -n "$RELEASE_TAG" ]]; then
+          echo "image-tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+        else
+          echo "image-tag=sha-$sha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        fi
+  build:
     needs: resolve-source
-    runs-on: ${{ vars.MODELEXPRESS_RELEASE_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 360
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 960
     permissions:
       contents: read
       id-token: write
@@ -85,108 +77,253 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: modelexpress-server
-            dockerfile: docker/modelexpress-server/Dockerfile
-          - image: modelexpress-vllm-runtime
-            dockerfile: examples/rl/dynamo_vllm_s3_delta_refit/Dockerfile
+        - image: modelexpress-server
+          dockerfile: docker/modelexpress-server/Dockerfile
+          arch: amd64
+          runner: ml-amd
+        - image: modelexpress-server
+          dockerfile: docker/modelexpress-server/Dockerfile
+          arch: arm64
+          runner: ml-arm
+        - image: modelexpress-vllm-runtime
+          dockerfile: examples/rl/dynamo_vllm_s3_delta_refit/Dockerfile
+          arch: amd64
+          runner: ml-amd
+        - image: modelexpress-vllm-runtime
+          dockerfile: examples/rl/dynamo_vllm_s3_delta_refit/Dockerfile
+          arch: arm64
+          runner: ml-arm
+    env:
+      DOCKER_BUILD_SUMMARY: 'false'
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
     steps:
-      - name: Select Artifactory repository
-        id: destination
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PROD_REPOSITORY: ${{ vars.ARTIFACTORY_OCI_PROD_REPOSITORY }}
-          DEV_REPOSITORY: ${{ vars.ARTIFACTORY_OCI_DEV_REPOSITORY }}
-          IMAGE: ${{ matrix.image }}
-          IMAGE_TAG: ${{ needs.resolve-source.outputs.image-tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
-            repository="$PROD_REPOSITORY"
-          else
-            repository="$DEV_REPOSITORY"
-          fi
-          if [[ -z "$repository" ]]; then
-            echo '::error::Artifactory is not provisioned. Merge .cw/artifact-mgmt/config.yaml to the default branch first.'
-            exit 1
-          fi
-          image="artifacts.coreweave.com/$repository/$IMAGE"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "tag=$image:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout resolved source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
-          persist-credentials: false
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-        with:
-          platforms: arm64,amd64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Set up JFrog CLI (Artifactory OIDC)
-        id: artifactory
-        uses: jfrog/setup-jfrog-cli@1e584506871998c267b7c100c02628a5b9c81db6 # v5
-        env:
-          JF_URL: ${{ vars.ARTIFACTORY_INSTANCE_URL }}
-          JF_PROJECT: ${{ vars.ARTIFACTORY_PROJECT_KEY }}
-        with:
-          oidc-provider-name: ${{ vars.ARTIFACTORY_OIDC_PROVIDER_NAME }}
-          oidc-audience: ${{ vars.ARTIFACTORY_OIDC_AUDIENCE }}
-
-      - name: Log in to Artifactory
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: artifacts.coreweave.com
-          username: ${{ steps.artifactory.outputs.oidc-user }}
-          password: ${{ steps.artifactory.outputs.oidc-token }}
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.destination.outputs.tag }}
-          build-contexts: |
-            dynamo=https://github.com/ai-dynamo/dynamo.git#c3e05f0244ae6264d7953f68e2499c6dc2f54723
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
-
-      - name: Verify published architectures
-        env:
-          IMAGE: ${{ steps.destination.outputs.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" |
-            jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] |
-              contains(["amd64", "arm64"])'
-
-      - name: Record published image
-        env:
-          IMAGE: ${{ steps.destination.outputs.image }}
-          TAG: ${{ steps.destination.outputs.tag }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
-        shell: bash
-        run: |
-          {
-            echo "### $IMAGE"
-            echo
-            echo "Platforms: linux/amd64, linux/arm64"
-            echo
-            echo "Source commit: $SOURCE_SHA"
-            echo
-            echo "Tag: \`$TAG\`"
-            echo
-            echo "Digest: \`$IMAGE@$DIGEST\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+    - name: Select Artifactory repository
+      id: destination
+      env:
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        PROD_REPOSITORY: ${{ vars.ARTIFACTORY_OCI_PROD_REPOSITORY }}
+        DEV_REPOSITORY: ${{ vars.ARTIFACTORY_OCI_DEV_REPOSITORY }}
+        IMAGE: ${{ matrix.image }}
+        IMAGE_TAG: ${{ needs.resolve-source.outputs.image-tag }}
+        ARCH: ${{ matrix.arch }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+          repository="$PROD_REPOSITORY"
+        else
+          repository="$DEV_REPOSITORY"
+        fi
+        if [[ -z "$repository" ]]; then
+          echo '::error::Artifactory is not provisioned. Merge .cw/artifact-mgmt/config.yaml to the default branch first.'
+          exit 1
+        fi
+        image="artifacts.coreweave.com/$repository/$IMAGE"
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "tag=$image:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+        if [[ -z "$DEV_REPOSITORY" ]]; then
+          echo '::error::The development repository is required for the build cache.'
+          exit 1
+        fi
+        echo "cache=artifacts.coreweave.com/$DEV_REPOSITORY/buildcache:$IMAGE-${ARCH}" >> "$GITHUB_OUTPUT"
+    - name: Checkout resolved source
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ needs.resolve-source.outputs.sha }}
+        persist-credentials: false
+    - name: Inspect runner storage
+      shell: bash
+      run: |-
+        df -h
+        df -i
+        test -S /run/buildkit/buildkitd.sock
+    - name: Connect to native BuildKit
+      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      with:
+        driver: remote
+        endpoint: unix:///run/buildkit/buildkitd.sock
+    - name: Obtain fresh Artifactory token
+      id: cache-auth
+      uses: jfrog/setup-jfrog-cli@1e584506871998c267b7c100c02628a5b9c81db6
+      env:
+        JF_URL: ${{ vars.ARTIFACTORY_INSTANCE_URL }}
+        JF_PROJECT: ${{ vars.ARTIFACTORY_PROJECT_KEY }}
+      with:
+        oidc-provider-name: ${{ vars.ARTIFACTORY_OIDC_PROVIDER_NAME }}
+        oidc-audience: ${{ vars.ARTIFACTORY_OIDC_AUDIENCE }}
+        disable-auto-build-publish: true
+        disable-job-summary: true
+    - name: Log in to Artifactory
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: artifacts.coreweave.com
+        username: ${{ steps.cache-auth.outputs.oidc-user }}
+        password: ${{ steps.cache-auth.outputs.oidc-token }}
+    - name: Compile with reusable build cache
+      uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294
+      with:
+        context: .
+        file: ${{ matrix.dockerfile }}
+        platforms: linux/${{ matrix.arch }}
+        build-contexts: dynamo=https://github.com/ai-dynamo/dynamo.git#c3e05f0244ae6264d7953f68e2499c6dc2f54723
+        labels: |-
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
+        cache-from: type=registry,ref=${{ steps.destination.outputs.cache }}
+        outputs: type=cacheonly
+    - name: Obtain fresh Artifactory token
+      id: push-auth
+      uses: jfrog/setup-jfrog-cli@1e584506871998c267b7c100c02628a5b9c81db6
+      env:
+        JF_URL: ${{ vars.ARTIFACTORY_INSTANCE_URL }}
+        JF_PROJECT: ${{ vars.ARTIFACTORY_PROJECT_KEY }}
+      with:
+        oidc-provider-name: ${{ vars.ARTIFACTORY_OIDC_PROVIDER_NAME }}
+        oidc-audience: ${{ vars.ARTIFACTORY_OIDC_AUDIENCE }}
+        disable-auto-build-publish: true
+        disable-job-summary: true
+    - name: Log in to Artifactory
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: artifacts.coreweave.com
+        username: ${{ steps.push-auth.outputs.oidc-user }}
+        password: ${{ steps.push-auth.outputs.oidc-token }}
+    - name: Push cached image by digest
+      id: build
+      uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294
+      with:
+        context: .
+        file: ${{ matrix.dockerfile }}
+        platforms: linux/${{ matrix.arch }}
+        build-contexts: dynamo=https://github.com/ai-dynamo/dynamo.git#c3e05f0244ae6264d7953f68e2499c6dc2f54723
+        labels: |-
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
+        cache-from: type=registry,ref=${{ steps.destination.outputs.cache }}
+        outputs: type=image,name=${{ steps.destination.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+        cache-to: type=registry,ref=${{ steps.destination.outputs.cache }},mode=max
+    - name: Export digest
+      env:
+        DIGEST: ${{ steps.build.outputs.digest }}
+      shell: bash
+      run: |-
+        mkdir -p "$RUNNER_TEMP/digests"
+        printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+    - name: Upload digest
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: digest-${{ matrix.image }}-${{ matrix.arch }}
+        path: ${{ runner.temp }}/digests/*
+        retention-days: 1
+        if-no-files-found: error
+        overwrite: true
+  publish:
+    needs:
+    - resolve-source
+    - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+        - modelexpress-server
+        - modelexpress-vllm-runtime
+    steps:
+    - name: Select Artifactory repository
+      id: destination
+      env:
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        PROD_REPOSITORY: ${{ vars.ARTIFACTORY_OCI_PROD_REPOSITORY }}
+        DEV_REPOSITORY: ${{ vars.ARTIFACTORY_OCI_DEV_REPOSITORY }}
+        IMAGE: ${{ matrix.image }}
+        IMAGE_TAG: ${{ needs.resolve-source.outputs.image-tag }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+          repository="$PROD_REPOSITORY"
+        else
+          repository="$DEV_REPOSITORY"
+        fi
+        if [[ -z "$repository" ]]; then
+          echo '::error::Artifactory is not provisioned. Merge .cw/artifact-mgmt/config.yaml to the default branch first.'
+          exit 1
+        fi
+        image="artifacts.coreweave.com/$repository/$IMAGE"
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "tag=$image:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+    - name: Download architecture digests
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        pattern: digest-${{ matrix.image }}-*
+        path: ${{ runner.temp }}/digests
+        merge-multiple: true
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+    - name: Obtain fresh Artifactory token
+      id: artifactory
+      uses: jfrog/setup-jfrog-cli@1e584506871998c267b7c100c02628a5b9c81db6
+      env:
+        JF_URL: ${{ vars.ARTIFACTORY_INSTANCE_URL }}
+        JF_PROJECT: ${{ vars.ARTIFACTORY_PROJECT_KEY }}
+      with:
+        oidc-provider-name: ${{ vars.ARTIFACTORY_OIDC_PROVIDER_NAME }}
+        oidc-audience: ${{ vars.ARTIFACTORY_OIDC_AUDIENCE }}
+        disable-auto-build-publish: true
+        disable-job-summary: true
+    - name: Log in to Artifactory
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: artifacts.coreweave.com
+        username: ${{ steps.artifactory.outputs.oidc-user }}
+        password: ${{ steps.artifactory.outputs.oidc-token }}
+    - name: Publish multi-platform tag
+      id: manifest
+      env:
+        IMAGE: ${{ steps.destination.outputs.image }}
+        TAG: ${{ steps.destination.outputs.tag }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        sources=()
+        for arch in amd64 arm64; do
+          digest=$(cat "$RUNNER_TEMP/digests/$arch")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          sources+=("$IMAGE@$digest")
+        done
+        docker buildx imagetools create --tag "$TAG" "${sources[@]}"
+        digest=$(docker buildx imagetools inspect "$TAG" --format '{{.Manifest.Digest}}')
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"
+    - name: Verify published architectures
+      env:
+        IMAGE: ${{ steps.destination.outputs.image }}
+        DIGEST: ${{ steps.manifest.outputs.digest }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" |
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] |
+            contains(["amd64", "arm64"])'
+    - name: Record published image
+      env:
+        IMAGE: ${{ steps.destination.outputs.image }}
+        TAG: ${{ steps.destination.outputs.tag }}
+        DIGEST: ${{ steps.manifest.outputs.digest }}
+        SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
+      shell: bash
+      run: |
+        {
+          echo "### $IMAGE"
+          echo
+          echo "Platforms: linux/amd64, linux/arm64"
+          echo
+          echo "Source commit: $SOURCE_SHA"
+          echo
+          echo "Tag: \`$TAG\`"
+          echo
+          echo "Digest: \`$IMAGE@$DIGEST\`"
+        } >> "$GITHUB_STEP_SUMMARY"
