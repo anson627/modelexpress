@@ -242,7 +242,10 @@ def _own_buffered_indexer_tensors(
     Streaming iterators may yield views into reused read buffers.
     """
     for name, tensor in weights:
-        if ".indexer.wk." in name:
+        if ".indexer.wk." in name and "wk_weights" not in name and (
+            (name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn)
+            or "weight_scale" in name
+        ):
             tensor = tensor.clone()
             recorded[name] = tensor
         yield name, tensor
@@ -262,7 +265,8 @@ def _rewrite_indexer_wk_pairs(model: torch.nn.Module, recorded: dict[str, torch.
     for name, tensor in recorded.items():
         prefix = name.rsplit(".wk.", 1)[0]
         pairs.setdefault(prefix, {})["scale" if "weight_scale" in name else "weight"] = (name, tensor)
-    incomplete = sorted(prefix for prefix, parts in pairs.items() if len(parts) != 2)
+    pairs = {prefix: parts for prefix, parts in pairs.items() if "weight" in parts}
+    incomplete = sorted(prefix for prefix, parts in pairs.items() if "scale" not in parts)
     if incomplete:
         raise RuntimeError(f"the stream lacks an FP8 indexer wk weight or scale: {incomplete}")
     if pairs:

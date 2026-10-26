@@ -1739,6 +1739,15 @@ agent.release_xfer_handle(handle)
 
 ## FP8 Model Handling (DeepSeek-V3)
 
+During iterator-based vLLM loads, ModelExpress clones FP8 (`torch.float8_e4m3fn`)
+indexer `wk.weight` tensors and their `weight_scale*` tensors to protect vLLM's
+buffered pairs from reused streaming buffers, then replays complete pairs together.
+An FP8 indexer weight without its scale fails the load. BF16 indexer weights and
+biases pass through without cloning or replay; they do not require scales, even
+in otherwise quantized checkpoints such as GLM-5.2-NVFP4. Pre-fused
+`wk_weights_proj` tensors also pass through unchanged. Scales without an FP8
+indexer weight do not trigger a replay.
+
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
 The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
